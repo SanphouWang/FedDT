@@ -52,13 +52,13 @@ def get_fedavg_argparser():
     parser.add_argument(
         "--gen-round",
         type=int,
-        default=10,
+        default=2,
         help="Number of global rounds for the generation task.",
     )
     parser.add_argument(
         "--gen-epochs",
         type=int,
-        default=10,
+        default=2,
         help="Number of local training epochs for the generation model.",
     )
     parser.add_argument(
@@ -142,12 +142,34 @@ class FedAvgServer:
         self.test_dataset = DATASETS[self.args.dataset](self.args, transform=self.transform)
 
     def generation_workflow(self):
-        client_model_weights_list = []
         for round_idx in range(self.args.gen_round):
-            for i in range(self.args.client_num):
-                client_model_weights_list.append(self.client.train_gen_model(i))
-
+            for client_idx in range(self.args.client_num):
+                self.client.train_gen_model(client_idx)
+            client_weights_list = self.client.get_client_weights()
+            model_dict_list_list = self.client.get_model_weights()
+            aggregated_model_dict_list = self.gen_aggreation(
+                model_dict_list_list, client_weights_list
+            )
+            self.client.download_model(aggregated_model_dict_list)
         pass
+
+    def gen_aggreation(self, model_dict_list_list, client_weights_list) -> List[OrderedDict]:
+        # aggregate model weights according to the weights of each client
+        model_num = len(model_dict_list_list[0])
+        aggregated_model_dict_list = [OrderedDict() for _ in range(model_num)]
+        # 'model' here refers to models like generators in cyclegan, instead of the whole cyclegan, which is differnet with the 'model' in the FedAvgClient
+        for client_idx, model_dict_list in enumerate(model_dict_list_list):
+            for model_idx, model_dict in enumerate(model_dict_list):
+                for key in model_dict.keys():
+                    if client_idx == 0:
+                        aggregated_model_dict_list[model_idx][key] = (
+                            model_dict[key] * client_weights_list[client_idx]
+                        )
+                    else:
+                        aggregated_model_dict_list[model_idx][key] += (
+                            model_dict[key] * client_weights_list[client_idx]
+                        )
+        return aggregated_model_dict_list
 
     def classification(self):
         pass

@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from pathlib import Path
 import sys
 from typing import List
@@ -37,10 +38,6 @@ class CycleGAN:
         self.cyclegen_120 = CycleGen()  # generate from modality1 to modality0
         self.cycledis_0 = CycleDis()  # discriminate fake modality0 from true image
         self.cycledis_1 = CycleDis()  # discriminate fake modality1 from true image
-        self.cyclegen_021.to(self.device)
-        self.cyclegen_120.to(self.device)
-        self.cycledis_0.to(self.device)
-        self.cycledis_1.to(self.device)
         # optimizers
         self.optimizer_cyclegen_021 = torch.optim.Adam(
             self.cyclegen_021.parameters(),
@@ -67,7 +64,7 @@ class CycleGAN:
         criterion_GAN = torch.nn.MSELoss().to(self.device)
         criterion_cycle = torch.nn.L1Loss().to(self.device)
         criterion_identity = torch.nn.L1Loss().to(self.device)
-        for i, batch in enumerate(self.trainloader):
+        for batch_idx, batch in enumerate(self.trainloader):
             volumes = batch[0]
             modalities: List[str] = batch[1]
             modality0_indices = [
@@ -170,15 +167,29 @@ class CycleGAN:
             loss_discrimination.backward()
             self.optimizer_cycledis_0.step()
             self.optimizer_cycledis_1.step()
-            print(f"batch {i} finished")
+            print(f"batch {batch_idx} finished")
 
-    def get_weigts(self) -> List:
+    def move2cpu(self):
+        self.cycledis_0.to("cpu")
+        self.cycledis_1.to("cpu")
+        self.cyclegen_120.to("cpu")
+        self.cyclegen_021.to("cpu")
+
+    def move2device(self):
+        self.cyclegen_021.to(self.device)
+        self.cyclegen_120.to(self.device)
+        self.cycledis_0.to(self.device)
+        self.cycledis_1.to(self.device)
+
+    def get_weights(self) -> List[OrderedDict]:
         return [
-            self.cyclegen_021.cpu().state_dict(),
-            self.cyclegen_120.cpu().state_dict(),
-            self.cycledis_0.cpu().state_dict(),
-            self.cycledis_1.cpu().state_dict(),
+            self.cyclegen_120.state_dict(),
+            self.cyclegen_021.state_dict(),
         ]
+
+    def download_weights(self, weights: List[OrderedDict]):
+        self.cyclegen_021.load_state_dict(weights[0])
+        self.cyclegen_120.load_state_dict(weights[1])
 
 
 if __name__ == "__main__":
