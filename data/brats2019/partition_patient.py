@@ -28,11 +28,16 @@ def partition_patient(args) -> Dict[int, Dict[str, List[str]]] and List[str] and
             A dictionary representing the path of each patient.
             The keys are the patient names and the values are the path of each patient.
     """
+
+    """
+    Initialize Basic Variables
+    """
     # initialize patient partition
     patient_partition = {}
     for i in range(args.client_num):
         patient_partition[i] = {}
     patient_partition["test"] = {}
+    patient_partition["valid"] = {}
     HGG_patient_list = os.listdir(os.path.join(args.data_path, "HGG"))
     LGG_patient_list = os.listdir(os.path.join(args.data_path, "LGG"))
     all_patient_list = HGG_patient_list + LGG_patient_list
@@ -46,6 +51,21 @@ def partition_patient(args) -> Dict[int, Dict[str, List[str]]] and List[str] and
     random.shuffle(all_patient_list)
     patient4train_list = all_patient_list[: int(len(all_patient_list) * args.ratio_train)]
     patient4test_list = all_patient_list[int(len(all_patient_list) * args.ratio_train) :]
+
+    """
+    Assgin Test Set and Validation Set
+    """
+    patient_partition["test"]["patient"] = patient4test_list
+    patient_partition["test"]["modality"] = [args.modality0, args.modality1]
+    # assign validation set
+    random.shuffle(patient4train_list)
+    num_extract = int(len(patient4train_list) * 0.1)
+    patient_partition["valid"]["patient"] = patient4train_list[:num_extract]
+    patient_partition["valid"]["modality"] = [args.modality0, args.modality1]
+
+    """
+    Generate Training Set
+    """
     # randomly sample clients from {0,1,...,client_num-1} to be the clients that have modality 0 and clients that have modality 1
     client_m0_num = int(args.client_num * args.ratio_m0)
     client_m1_num = int(args.client_num * args.ratio_m1)
@@ -97,9 +117,7 @@ def partition_patient(args) -> Dict[int, Dict[str, List[str]]] and List[str] and
             set(patient4train_list) - set(patient_partition[client_idx][args.modality1])
         )
     # assgin test set
-    patient_partition["test"][args.modality0] = patient4test_list
-    patient_partition["test"][args.modality1] = patient4test_list
-    patient_partition["test"]["modality"] = [args.modality0, args.modality1]
+
     # print(len(patient4train_list))
     return patient_partition, patient_path_dict
 
@@ -149,7 +167,7 @@ def add_argument():
     parser.add_argument(
         "--slice_idx_begin",
         type=int,
-        default=50,
+        default=60,
         help="beginning slice index, each volume in Brats2019 has 155 slices",
     )
     parser.add_argument(

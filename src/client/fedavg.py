@@ -14,9 +14,10 @@ from src.utils.models import get_model_arch
 
 
 class FedAvgClient:
-    def __init__(self, args, device):
+    def __init__(self, args, device, logger):
         self.args = args
         self.device = device
+        self.logger = logger
         self.client_num = self.args.client_num
         self.transform = ToTensor()
         self.dataset_list = [
@@ -56,7 +57,7 @@ class FedAvgClient:
         self.gen_model_list[client_idx].move2device()
         for i in range(self.args.gen_epochs):
             self.gen_model_list[client_idx].train_epoch()
-            print(f"client {client_idx} epoch {i} finished")
+        self.logger.log(f"client {client_idx} finished")
         self.gen_model_list[client_idx].move2cpu()
 
     def upload_model(self):

@@ -1,15 +1,21 @@
 from collections import OrderedDict
+import os
 from pathlib import Path
+import random
 import sys
 from typing import List
 from torch.autograd import Variable
+import matplotlib.pyplot as plt
 
 import torch
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+import matplotlib.pyplot as plt
 
 PROJECT_DIR = Path(__file__).parent.parent.parent.absolute()
 sys.path.append(PROJECT_DIR.as_posix())
 
 from src.utils.basic_models import CycleDis, CycleGen
+import cv2
 
 
 def get_model_arch(model_name):
@@ -24,21 +30,14 @@ def get_model_arch(model_name):
 
 
 class CycleGAN:
-    def __init__(
-        self,
-        args,
-        device,
-        trainloader,
-    ) -> None:
+    def __init__(self, args, device, dataloader, mode="train") -> None:
         self.args = args
         self.device = device
-        self.trainloader = trainloader
-        # generators and discriminators
+        self.dataloader = dataloader
+        self.mode = mode
+        # generators, discriminators and optimizers
         self.cyclegen_021 = CycleGen()  # generate from modality0 to modality1
         self.cyclegen_120 = CycleGen()  # generate from modality1 to modality0
-        self.cycledis_0 = CycleDis()  # discriminate fake modality0 from true image
-        self.cycledis_1 = CycleDis()  # discriminate fake modality1 from true image
-        # optimizers
         self.optimizer_cyclegen_021 = torch.optim.Adam(
             self.cyclegen_021.parameters(),
             lr=self.args.gen_lr,
@@ -49,22 +48,25 @@ class CycleGAN:
             lr=self.args.gen_lr,
             betas=(self.args.gen_beta1, self.args.gen_beta2),
         )
-        self.optimizer_cycledis_0 = torch.optim.Adam(
-            self.cycledis_0.parameters(),
-            lr=self.args.gen_lr,
-            betas=(self.args.gen_beta1, self.args.gen_beta2),
-        )
-        self.optimizer_cycledis_1 = torch.optim.Adam(
-            self.cycledis_1.parameters(),
-            lr=self.args.gen_lr,
-            betas=(self.args.gen_beta1, self.args.gen_beta2),
-        )
+        if mode == "train":
+            self.cycledis_0 = CycleDis()  # discriminate fake modality0 from true image
+            self.cycledis_1 = CycleDis()  # discriminate fake modality1 from true image
+            self.optimizer_cycledis_0 = torch.optim.Adam(
+                self.cycledis_0.parameters(),
+                lr=self.args.gen_lr,
+                betas=(self.args.gen_beta1, self.args.gen_beta2),
+            )
+            self.optimizer_cycledis_1 = torch.optim.Adam(
+                self.cycledis_1.parameters(),
+                lr=self.args.gen_lr,
+                betas=(self.args.gen_beta1, self.args.gen_beta2),
+            )
 
     def train_epoch(self):
         criterion_GAN = torch.nn.MSELoss().to(self.device)
         criterion_cycle = torch.nn.L1Loss().to(self.device)
         criterion_identity = torch.nn.L1Loss().to(self.device)
-        for batch_idx, batch in enumerate(self.trainloader):
+        for batch_idx, batch in enumerate(self.dataloader):
             volumes = batch[0]
             modalities: List[str] = batch[1]
             modality0_indices = [
@@ -78,8 +80,8 @@ class CycleGAN:
             """
             self.cyclegen_021.train()
             self.cyclegen_120.train()
-            self.cycledis_1.eval()
-            self.cycledis_0.eval()
+            self.cycledis_0.train()
+            self.cycledis_1.train()
             # initialize loss terms
             loss_GAN_021 = torch.tensor(0.0, dtype=torch.float, requires_grad=True)
             loss_id_021 = torch.tensor(0.0, dtype=torch.float, requires_grad=True)
@@ -129,8 +131,7 @@ class CycleGAN:
             """
             Train Discriminator
             """
-            self.cycledis_0.train()
-            self.cycledis_1.train()
+
             loss_fake_1 = torch.tensor(0.0, dtype=torch.float, requires_grad=True)
             loss_real_0 = torch.tensor(0.0, dtype=torch.float, requires_grad=True)
             loss_fake_0 = torch.tensor(0.0, dtype=torch.float, requires_grad=True)
@@ -167,19 +168,20 @@ class CycleGAN:
             loss_discrimination.backward()
             self.optimizer_cycledis_0.step()
             self.optimizer_cycledis_1.step()
-            print(f"batch {batch_idx} finished")
 
     def move2cpu(self):
-        self.cycledis_0.to("cpu")
-        self.cycledis_1.to("cpu")
+        if self.mode == "train":
+            self.cycledis_0.to("cpu")
+            self.cycledis_1.to("cpu")
         self.cyclegen_120.to("cpu")
         self.cyclegen_021.to("cpu")
 
     def move2device(self):
         self.cyclegen_021.to(self.device)
         self.cyclegen_120.to(self.device)
-        self.cycledis_0.to(self.device)
-        self.cycledis_1.to(self.device)
+        if self.mode == "train":
+            self.cycledis_0.to(self.device)
+            self.cycledis_1.to(self.device)
 
     def get_weights(self) -> List[OrderedDict]:
         return [
@@ -188,8 +190,88 @@ class CycleGAN:
         ]
 
     def download_weights(self, weights: List[OrderedDict]):
-        self.cyclegen_021.load_state_dict(weights[0])
-        self.cyclegen_120.load_state_dict(weights[1])
+        self.cyclegen_120.load_state_dict(weights[0])
+        self.cyclegen_021.load_state_dict(weights[1])
+
+    def test(self):
+        self.cyclegen_021.eval()
+        self.cyclegen_120.eval()
+        psnr_func = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+        ssim_func = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
+        psnr_021_list = []
+        psnr_120_list = []
+        ssim_021_list = []
+        ssim_120_list = []
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.dataloader):
+                real_modality0 = batch["modality0"]
+                real_modality1 = batch["modality1"]
+                real_modality0 = real_modality0.view(
+                    -1, 1, real_modality0.shape[2], real_modality0.shape[3]
+                ).to(self.device)
+                real_modality1 = real_modality1.view(
+                    -1, 1, real_modality1.shape[2], real_modality1.shape[3]
+                ).to(self.device)
+                fake_modality1 = self.cyclegen_021(real_modality0)
+                fake_modality0 = self.cyclegen_120(real_modality1)
+                # calculate psnr and ssim
+                psnr_021_list.append(psnr_func(real_modality1, fake_modality1))
+                psnr_120_list.append(psnr_func(real_modality0, fake_modality0))
+                ssim_021_list.append(ssim_func(real_modality1, fake_modality1))
+                ssim_120_list.append(ssim_func(real_modality0, fake_modality0))
+        mean_psnr_021 = torch.mean(torch.stack(psnr_021_list), dim=0).cpu()
+        mean_psnr_120 = torch.mean(torch.stack(psnr_120_list), dim=0).cpu()
+        mean_ssim_021 = torch.mean(torch.stack(ssim_021_list), dim=0).cpu()
+        mean_ssim_120 = torch.mean(torch.stack(ssim_120_list), dim=0).cpu()
+        return {
+            "psnr_021": round(mean_psnr_021.item(), 4),
+            "psnr_120": round(mean_psnr_120.item(), 4),
+            "ssim_021": round(mean_ssim_021.item(), 4),
+            "ssim_120": round(mean_ssim_120.item(), 4),
+        }
+
+    def generate_image(self, out_dir):
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+
+        self.cyclegen_021.eval()
+        self.cyclegen_120.eval()
+        with torch.no_grad():
+            batch = next(iter(self.dataloader))
+            real_modality0 = batch["modality0"].to(self.device)
+            real_modality1 = batch["modality1"].to(self.device)
+            real_modality0 = real_modality0.view(
+                -1, 1, real_modality0.shape[2], real_modality0.shape[3]
+            ).to(self.device)
+            real_modality1 = real_modality1.view(
+                -1, 1, real_modality1.shape[2], real_modality1.shape[3]
+            ).to(self.device)
+            fake_modality1 = self.cyclegen_021(real_modality0)
+            fake_modality0 = self.cyclegen_120(real_modality1)
+            # randomly select 4 slices
+            slice_idx = random.sample(range(real_modality0.shape[0]), 4)
+            real_modality0 = real_modality0[slice_idx]
+            real_modality1 = real_modality1[slice_idx]
+            fake_modality1 = fake_modality1[slice_idx]
+            fake_modality0 = fake_modality0[slice_idx]
+            for i in range(4):
+                fig, axs = plt.subplots(1, 4, figsize=(12, 6))
+                # for modality in [real_modality0, real_modality1, fake_modality1, fake_modality0]:
+
+                axs[0].imshow(real_modality0[i].squeeze().cpu().numpy(), cmap="gray")
+                axs[0].set_title(f"Real Modality0")
+                axs[0].axis("off")
+                axs[1].imshow(real_modality1[i].squeeze().cpu().numpy(), cmap="gray")
+                axs[1].set_title(f"Real Modality1")
+                axs[1].axis("off")
+                axs[2].imshow(fake_modality1[i].squeeze().cpu().numpy(), cmap="gray")
+                axs[2].set_title(f"Fake Modality1")
+                axs[2].axis("off")
+                axs[3].imshow(fake_modality0[i].squeeze().cpu().numpy(), cmap="gray")
+                axs[3].set_title(f"Fake Modality0")
+                axs[3].axis("off")
+                plt.tight_layout()
+                plt.savefig(f"{out_dir}/generated{i}.jpg")
 
 
 if __name__ == "__main__":
