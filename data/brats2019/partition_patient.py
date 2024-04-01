@@ -16,17 +16,22 @@ def partition_patient(args) -> Dict[int, Dict[str, List[str]]] and List[str] and
     Returns:
         patient_partition: Dict
             A dictionary representing the patient partition.
-            The keys are the client_idx numbers (0, 1, 2, ...) and the values are client_idx dictionary containing the patient data for each client_idx.
-            Each client_idx dictionary has the following keys:
-            - args.modality0: A list of patients assigned to the client_idx with modality 0.
-            - args.modality1: A list of patients assigned to the client_idx with modality 1.
-            - "paired_patient": A list of patients assigned to the client_idx that have both modalities. (if the client_idx has single modality, this key does not exist.)
-            - "modality": A list of modalities assigned to the client_idx.
-        patient4test_list: List
-            A list of patients assigned to the test set.
+            Keys: client_idx numbers (0, 1, 2, ...), 'test', 'valid'
+            Values:
+                if key is client_idx:
+                    The values are client_idx dictionary containing the patient data for each client_idx.
+                    Each client_idx dictionary has the following key-value:
+                    - args.modality0: A list of patients assigned to the client_idx with modality 0. if this client has no modality0, this value would be []
+                    - args.modality1: A list of patients assigned to the client_idx with modality 1. if this client has no modality1, this value would be []
+                    - "paired_patient": A list of patients assigned to the client_idx that have both modalities.
+                    - "modality": A list of modalities assigned to the client_idx.
+                if key is 'test' or 'valid':
+                    value is a Dict, whose key-value are:
+                    - "patient": A list of patients assigned to the test or validation set.
+                    - "modality": A list of modalities assigned to the test or validation set.
         patient_path_dict: Dict
             A dictionary representing the path of each patient.
-            The keys are the patient names and the values are the path of each patient.
+            The keys are the patient names and the values are the path of this patient.
     """
 
     """
@@ -36,6 +41,10 @@ def partition_patient(args) -> Dict[int, Dict[str, List[str]]] and List[str] and
     patient_partition = {}
     for i in range(args.client_num):
         patient_partition[i] = {}
+        patient_partition[i]["modality"] = []
+        patient_partition[i]["paired_patient"] = []
+        patient_partition[i][args.modality0] = []
+        patient_partition[i][args.modality1] = []
     patient_partition["test"] = {}
     patient_partition["valid"] = {}
     HGG_patient_list = os.listdir(os.path.join(args.data_path, "HGG"))
@@ -129,14 +138,14 @@ def add_argument():
         "-rm0",
         "--ratio_m0",
         type=float,
-        default=0.6,
+        default=1.0,
         help="Ratio of clients having modality 0",
     )
     parser.add_argument(
         "-rm1",
         "--ratio_m1",
         type=float,
-        default=0.6,
+        default=1.0,
         help="Ratio of clients having modality 1",
     )
     parser.add_argument(

@@ -9,8 +9,12 @@ from torch.utils.data import DataLoader
 PROJECT_DIR = Path(__file__).parent.parent.parent.absolute()
 from data.utils.datasets import DATASETS
 
+import torch.optim as optim
 
-from src.utils.models import get_model_arch
+from src.utils.tools import move2device, move2cpu
+from src.model.model_tools import get_model_arch
+from tqdm import tqdm
+import torch.nn as nn
 
 
 class FedAvgClient:
@@ -20,6 +24,7 @@ class FedAvgClient:
         self.logger = logger
         self.client_num = self.args.client_num
         self.transform = ToTensor()
+        self.dataset_class = DATASETS[self.args.dataset]
         self.dataset_list = [
             DATASETS[self.args.dataset](self.args, client_id=i) for i in range(self.client_num)
         ]
@@ -28,42 +33,101 @@ class FedAvgClient:
             DataLoader(self.dataset_list[i], batch_size=self.args.gen_batch_size, shuffle=True)
             for i in range(self.client_num)
         ]
+        self.class_loader_list = [
+            DataLoader(self.dataset_list[i], batch_size=self.args.class_batchsize, shuffle=True)
+            for i in range(self.client_num)
+        ]
         # gen model refer to generation model class, e.g. CycleGAN class
         self.gen_model_list = [
             get_model_arch(self.args.gen_model)(self.args, self.device, train_loader)
             for train_loader in self.train_loader_list
         ]
+        # list classification models
+        self.class_model_list = [
+            get_model_arch(self.args.class_model)(self.args)
+            for train_loader in self.train_loader_list
+        ]
 
     def get_client_weights(self) -> List[float]:
         # generate weight of each client for model aggregation in server
-        dataset_len_list = [len(dataset) for dataset in self.dataset_list]
+        dataset_len_list = [dataset.get_len() for dataset in self.dataset_list]
         total_num = sum(dataset_len_list)
         weights_list = [len_dataset / total_num for len_dataset in dataset_len_list]
         return weights_list
 
-    def get_model_weights(self) -> List[List[OrderedDict]]:
+    def gen_get_model_weights(self) -> List[List[OrderedDict]]:
         # return weights of models on each client
         # since each model may have different submodels (e.g. CycleGAN has two generator and discriminator)
         # each element in the returned list is a list of weights of submodels (e.g. [weights of generator1, weights of generator2, ...])
         return [model.get_weights() for model in self.gen_model_list]
 
-    def download_model(self, aggregated_model_dict_list):
+    def gen_download_model(self, aggregated_model_dict_list, resume=False):
         for model in self.gen_model_list:
-            model.download_weights(aggregated_model_dict_list)
+            model.download_weights(aggregated_model_dict_list, resume)
         pass
 
-    def train_gen_model(self, client_idx):
+    def gen_train_model(self, client_idx):
         # Train the generation model locally
         self.gen_model_list[client_idx].move2device()
         for i in range(self.args.gen_epochs):
             self.gen_model_list[client_idx].train_epoch()
-        self.logger.log(f"client {client_idx} finished")
+            self.gen_model_list[client_idx].update_learning_rate()
+        result_after = self.gen_model_list[client_idx].evaluate_training()
+        self.logger.log(
+            f"client {client_idx} finished. "
+            + "After: "
+            + " ".join([f"{key}: {float(value):.5f}. " for key, value in result_after.items()]),
+        )
         self.gen_model_list[client_idx].move2cpu()
 
-    def upload_model(self):
-        # Upload the trained model to the server
+    def class_train_model(self, client_idx):
+        # Train the classification model locally
+        criterion = nn.CrossEntropyLoss()
+        dataloader = self.class_loader_list[client_idx]
+        class_model = self.class_model_list[client_idx]
+        optimizer = optim.SGD(
+            class_model.parameters(),
+            lr=self.args.class_lr,
+            momentum=self.args.momentum,
+            weight_decay=self.args.weight_decay,
+        )
+        class_model = move2device(self.device, self.args.multi_gpu, class_model)
+        if self.args.use_generator:
+            generator_021, generator_120 = self.gen_model_list[client_idx].get_generator()
+            generator_021.eval()
+            generator_120.eval()
+            generator_021 = move2device(self.device, self.args.multi_gpu, generator_021)
+            generator_120 = move2device(self.device, self.args.multi_gpu, generator_120)
+        class_model.train()
+        pbar = tqdm(range(self.args.class_epochs), unit="epoch")
+        for epoch in pbar:
+            pbar.set_description(f"Client {client_idx} Epoch {epoch}")
+            for batch in dataloader:
+                image, label = self.dataset_class.class_organize_batch(
+                    batch, self.args, self.device, generator_021, generator_120
+                )
+                # forward pass
+                output = class_model(image)
+                # calculate loss
+                loss = criterion(output, label)
+                # backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        class_model = move2cpu(class_model)
+        if self.args.use_generator:
+            move2cpu(generator_021)
+            move2cpu(generator_120)
         pass
 
-    def get_training_data(self):
-        # Get the training data from a local data source
+    def class_test(self):
+        # Test the classification model locally
         pass
+
+    def class_get_model_weights(self) -> List[List[OrderedDict]]:
+        return [[model.state_dict()] for model in self.class_model_list]
+
+    def class_download_model(self, aggregated_model_dict_list, resume=False):
+        for model in self.class_model_list:
+            model.load_state_dict(aggregated_model_dict_list[0])

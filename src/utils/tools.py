@@ -6,14 +6,17 @@ from copy import deepcopy
 from collections import Counter, OrderedDict
 from typing import List, Tuple, Union
 from pathlib import Path
-
+import torchvision
 import torch
 import pynvml
 import numpy as np
 from torch.utils.data import DataLoader
 from rich.console import Console
+import sys
 
 PROJECT_DIR = Path(__file__).parent.parent.parent.absolute()
+sys.path.append(PROJECT_DIR.as_posix())
+
 OUT_DIR = PROJECT_DIR / "out"
 TEMP_DIR = PROJECT_DIR / "temp"
 
@@ -149,3 +152,20 @@ def update_args_from_dict(args, config_dict):
         else:
             setattr(args, key, value)
     return args
+
+
+def move2device(device, multi_gpu, model):
+
+    model.to(device)
+    if multi_gpu:
+        device_index_list = list(range(torch.cuda.device_count()))
+        device_index_list.insert(0, device_index_list.pop(device_index_list.index(device.index)))
+        model = torch.nn.DataParallel(model, device_ids=device_index_list)
+    return model
+
+
+def move2cpu(model):
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module
+    model.to(torch.device("cpu"))
+    return model
