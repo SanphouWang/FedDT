@@ -169,4 +169,3 @@ def move2cpu(model):
         model = model.module
     model.to(torch.device("cpu"))
     return model
-
