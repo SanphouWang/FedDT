@@ -170,6 +170,3 @@ def move2cpu(model):
     model.to(torch.device("cpu"))
     return model
 
-
-if __name__ == "__main__":
-    print("tools.py")
