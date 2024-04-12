@@ -156,7 +156,7 @@ def update_args_from_dict(args, config_dict):
 
 def move2device(device, multi_gpu, model):
 
-    model.to(device)
+    model = model.to(device)
     if multi_gpu:
         device_index_list = list(range(torch.cuda.device_count()))
         device_index_list.insert(0, device_index_list.pop(device_index_list.index(device.index)))
@@ -167,5 +167,5 @@ def move2device(device, multi_gpu, model):
 def move2cpu(model):
     if isinstance(model, torch.nn.DataParallel):
         model = model.module
-    model.to(torch.device("cpu"))
+    model = model.to(torch.device("cpu"))
     return model

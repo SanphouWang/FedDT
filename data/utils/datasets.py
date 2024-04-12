@@ -12,7 +12,7 @@ import pickle
 
 
 class Brats2019(Dataset):
-    def __init__(self, args, client_id=None, transform=None, test_valid=None):
+    def __init__(self, args, client_id=None, transform=None):
         self.args = args
         self.client_id = client_id
         self.size = 256
@@ -27,8 +27,8 @@ class Brats2019(Dataset):
                 ]
             )
         )
+
         self.image_shape = (1, self.size, self.size)
-        self.test_valid = test_valid
         with open(
             os.path.join(args.data_path, "preprocessed_files", "patient_path.pkl"), "rb"
         ) as f:
@@ -39,15 +39,16 @@ class Brats2019(Dataset):
             self.patient_partition = pickle.load(f)
 
         # judge the type of dataset
-        if self.client_id is not None:
+        if self.client_id != "test" and self.client_id != "valid":
             self.mode = "train"
-        elif self.test_valid is None:
-            raise ValueError("test_valid should be specified when client_id is None")
-        elif self.test_valid == "test":
+            self.transform.transforms.insert(2, transforms.RandomHorizontalFlip(p=0.5))
+        elif self.client_id == "test":
             self.mode = "test"
-        else:
+        elif self.client_id == "valid":
             self.mode = "valid"
-
+        else:
+            raise ValueError("client_id should be either 'test' or 'valid' or a client id")
+        self.num_classes = 2
         # read dictinaries
         if self.mode == "train":
             self.patient_partition: Dict[str, List] = self.patient_partition[client_id]
@@ -68,6 +69,19 @@ class Brats2019(Dataset):
             else:
                 self.patient_partition: Dict[str, List] = self.patient_partition["valid"]
             self.patient_list = self.patient_partition["patient"]
+
+    def get_slice(self, idx):
+        idx = idx + 1
+        slices_num = self.args.slice_idx_end - self.args.slice_idx_begin
+        patient_idx = idx // slices_num
+        patient_name = self.patient_list[patient_idx]
+        patient_path = self.patient_path_dict[patient_name]
+        label = patient_path.split("/")[-2]
+        label = torch.tensor([0]) if label == "HGG" else torch.tensor([1])
+        slice_idx = idx % slices_num
+        if slice_idx == 0:
+            slice_idx = slices_num
+        slice_idx = slice_idx + self.args.slice_idx_begin - 1
 
     def load_brain_volume(self, patient_idx: str, modality: str) -> np.ndarray:
         patient_path = self.patient_path_dict[patient_idx]
@@ -155,21 +169,30 @@ class Brats2019(Dataset):
         modality1_volumes_original = batch["modality1"]
         labels_original = batch["label"]
         modality0_volumes = modality0_volumes_original[modality0_indices]
-        modality0_labels = labels_original[modality0_indices]
-        modality0_labels_repeat = modality0_labels.repeat(1, modality0_volumes.shape[1])
-        modality0_labels_vectorized = modality0_labels_repeat.view(-1, 1).to(device)
-        real_modality0 = modality0_volumes.view(
-            -1, 1, modality0_volumes.shape[2], modality0_volumes.shape[3]
-        ).to(device)
+        modality0_volumes = modality0_volumes.unsqueeze(2)
+        real_modality0 = modality0_volumes.permute(0, 2, 1, 3, 4)
+        modality0_labels = labels_original[modality0_indices].squeeze(1)
         modality1_volumes = modality1_volumes_original[modality1_indices]
-        modality1_labels = labels_original[modality1_indices]
-        modality1_labels_repeat = modality1_labels.repeat(1, modality1_volumes.shape[1])
-        modality1_labels_vectorized = modality1_labels_repeat.view(-1, 1).to(device)
-        real_modality1 = modality1_volumes.view(
-            -1, 1, modality1_volumes.shape[2], modality1_volumes.shape[3]
-        ).to(device)
+        modality1_volumes = modality1_volumes.unsqueeze(2)
+        real_modality1 = modality1_volumes.permute(0, 2, 1, 3, 4)
+        modality1_labels = labels_original[modality1_indices].squeeze(1)
         image = torch.cat([real_modality0, real_modality1], dim=0)
-        label = torch.cat([modality0_labels_vectorized, modality1_labels_vectorized], dim=0)
+        label = torch.cat([modality0_labels, modality1_labels], dim=0)
+
+        # modality0_labels_repeat = modality0_labels.repeat(1, modality0_volumes.shape[1])
+        # modality0_labels_vectorized = modality0_labels_repeat.view(-1, 1).to(device)
+        # real_modality0 = modality0_volumes.view(
+        #     -1, 1, modality0_volumes.shape[2], modality0_volumes.shape[3]
+        # ).to(device)
+        # modality1_volumes = modality1_volumes_original[modality1_indices]
+        # modality1_labels = labels_original[modality1_indices]
+        # modality1_labels_repeat = modality1_labels.repeat(1, modality1_volumes.shape[1])
+        # modality1_labels_vectorized = modality1_labels_repeat.view(-1, 1).to(device)
+        # real_modality1 = modality1_volumes.view(
+        #     -1, 1, modality1_volumes.shape[2], modality1_volumes.shape[3]
+        # ).to(device)
+        # image = torch.cat([real_modality0, real_modality1], dim=0)
+        # label = torch.cat([modality0_labels_vectorized, modality1_labels_vectorized], dim=0)
         if args.use_generator and generator_021 is not None and generator_120 is not None:
             with torch.no_grad():
                 # generate fake modality1 and its labels
@@ -194,9 +217,7 @@ class Brats2019(Dataset):
                 single_modality1_labels_repeat = single_modality1_labels.repeat(
                     1, args.slice_idx_end - args.slice_idx_begin
                 )
-                single_modality1_labels_vectorized = single_modality1_labels_repeat.view(-1, 1).to(
-                    device
-                )
+                single_modality1_labels_vectorized = single_modality1_labels_repeat.view(-1, 1)
                 image = torch.cat([image, fake_modality0, fake_modality1], dim=0).to(device)
                 label = torch.cat(
                     [
@@ -206,7 +227,7 @@ class Brats2019(Dataset):
                     ],
                     dim=0,
                 ).to(device)
-        return image, label.squeeze(1)
+        return image, label
 
     def __getitem__(self, idx):
         """

@@ -117,15 +117,44 @@ class MobileNet(DecoupledModel):
         self.base.classifier[-1] = nn.Identity()
 
 
+class modifybasicstem(nn.Sequential):
+    """The default conv-batchnorm-relu stem"""
+
+    def __init__(self):
+        super(modifybasicstem, self).__init__(
+            nn.Conv3d(
+                1, 64, kernel_size=(3, 7, 7), stride=(1, 2, 2), padding=(1, 3, 3), bias=False
+            ),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+        )
+
+
+def resnet_mixed_conv():
+    model = models.video.mc3_18(weights=models.video.MC3_18_Weights)
+    model.stem = modifybasicstem()
+    model.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(model.fc.in_features, 2))
+    return model
+
+
+# class ResNetMixedConv(DecoupledModel):
+#     def __init__(self, args):
+#         super().__init__()
+#         model = models.video.mc3_18(weights=models.ResNet50_Weights.DEFAULT)
+#         model.stem = modifybasicstem()
+#         self.classifier = model
+
+
 if __name__ == "__main__":
 
     class Args:
         dataset = "brats2019"
 
     args = Args
-    model = ResNet50(args)
+    # model = ResNet50(args)
+    model = resnet_mixed_conv()
     # Generate random tensor
-    input_tensor = torch.randn(20, 1, 256, 256)
+    input_tensor = torch.randn(3, 1, 20, 256, 256)
 
     # Pass the input tensor through the model
     output_tensor = model(input_tensor)

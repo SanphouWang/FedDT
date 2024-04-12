@@ -39,7 +39,7 @@ class FedAvgClient:
         ]
         # gen model refer to generation model class, e.g. CycleGAN class
         self.gen_model_list = [
-            get_model_arch(self.args.gen_model)(self.args, self.device, train_loader)
+            get_model_arch(self.args.gen_model)(self.args, self.device, train_loader, self.logger)
             for train_loader in self.train_loader_list
         ]
         # list classification models
@@ -69,15 +69,19 @@ class FedAvgClient:
     def gen_train_model(self, client_idx):
         # Train the generation model locally
         self.gen_model_list[client_idx].move2device()
+        self.logger.log(f"client {client_idx} begin. ")
+
         for i in range(self.args.gen_epochs):
             self.gen_model_list[client_idx].train_epoch()
             self.gen_model_list[client_idx].update_learning_rate()
-        result_after = self.gen_model_list[client_idx].evaluate_training()
-        self.logger.log(
-            f"client {client_idx} finished. "
-            + "After: "
-            + " ".join([f"{key}: {float(value):.5f}. " for key, value in result_after.items()]),
-        )
+        # if self.args.gen_eval_train:
+        #     result_after = self.gen_model_list[client_idx].evaluate_training()
+        # self.logger.log(f"client {client_idx} finish. ")
+        # if self.args.gen_eval_train:
+        #     self.logger.log(
+        #         "After: "
+        #         + " ".join([f"{key}: {float(value):.5f}. " for key, value in result_after.items()]),
+        #     )
         self.gen_model_list[client_idx].move2cpu()
 
     def class_train_model(self, client_idx):
@@ -99,13 +103,18 @@ class FedAvgClient:
             generator_021 = move2device(self.device, self.args.multi_gpu, generator_021)
             generator_120 = move2device(self.device, self.args.multi_gpu, generator_120)
         class_model.train()
-        pbar = tqdm(range(self.args.class_epochs), unit="epoch")
-        for epoch in pbar:
-            pbar.set_description(f"Client {client_idx} Epoch {epoch}")
+
+        for epoch in range(self.args.class_epochs):
+
             for batch in dataloader:
-                image, label = self.dataset_class.class_organize_batch(
-                    batch, self.args, self.device, generator_021, generator_120
-                )
+                if self.args.use_generator:
+                    image, label = self.dataset_class.class_organize_batch(
+                        batch, self.args, self.device, generator_021, generator_120
+                    )
+                else:
+                    image, label = self.dataset_class.class_organize_batch(
+                        batch, self.args, self.device
+                    )
                 # forward pass
                 output = class_model(image)
                 # calculate loss
@@ -114,8 +123,28 @@ class FedAvgClient:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
-        class_model = move2cpu(class_model)
+            # Evaluate accuracy and loss on the training set
+            # class_model.eval()
+            total_loss = 0
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for batch in dataloader:
+                    image, label = self.dataset_class.class_organize_batch(
+                        batch, self.args, self.device
+                    )
+                    output = class_model(image)
+                    loss = criterion(output, label)
+                    total_loss += loss.item()
+                    predictions = torch.argmax(output, dim=1)
+                    total += label.size(0)
+                    correct += (predictions == label).sum().item()
+            accuracy = 100.0 * correct / total
+            average_loss = total_loss / len(dataloader)
+            self.logger.log(
+                f"Clinet {client_idx} Training Set: Accuracy={accuracy:.4f}%, Loss={average_loss:.4f}"
+            )
+        move2cpu(class_model)
         if self.args.use_generator:
             move2cpu(generator_021)
             move2cpu(generator_120)

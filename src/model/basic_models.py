@@ -5,6 +5,25 @@ import functools
 
 
 # __all__ = ["CycleGen", "CycleDis", "UNetDown", "UNetUp"]
+
+
+def get_norm_layer(norm_type="instance"):
+    """Return a normalization layer
+    Parameters:
+        norm_type (str) -- the name of the normalization layer: batch | instance | none
+    For BatchNorm, we use learnable affine parameters and track running statistics (mean/stddev).
+    For InstanceNorm, we do not use learnable affine parameters. We do not track running statistics.
+    """
+    if norm_type == "batch":
+        norm_layer = functools.partial(nn.BatchNorm2d, affine=True, track_running_stats=True)
+    elif norm_type == "instance":
+        norm_layer = functools.partial(nn.InstanceNorm2d, affine=False, track_running_stats=False)
+
+    else:
+        raise NotImplementedError("normalization layer [%s] is not found" % norm_type)
+    return norm_layer
+
+
 class UNetDown(nn.Module):
     """Descending block of the U-Net.
 
@@ -81,9 +100,9 @@ class CycleGen(nn.Module):
         self.down2 = UNetDown(64, 128)
         self.down3 = UNetDown(128, 256)
         self.down4 = UNetDown(256, 512)
-        self.down5 = UNetDown(512, 512)
+        self.down5 = UNetDown(512, 1024)
 
-        self.up1 = UNetUp(512, 512)
+        self.up1 = UNetUp(1024, 512)
         self.up2 = UNetUp(1024, 256)
         self.up3 = UNetUp(512, 128)
         self.up4 = UNetUp(256, 64)
@@ -155,7 +174,7 @@ class ResnetGenerator(nn.Module):
         input_nc=1,
         output_nc=1,
         ngf=64,
-        norm_layer=nn.BatchNorm2d,
+        norm_layer=get_norm_layer("instance"),
         use_dropout=False,
         n_blocks=6,
         padding_type="reflect",
@@ -306,7 +325,7 @@ class NLayerDiscriminator(nn.Module):
         input_nc=1,
         ndf=64,
         n_layers=3,
-        norm_layer=nn.InstanceNorm2d,
+        norm_layer=get_norm_layer("instance"),
         use_sigmoid=False,
         gpu_ids=[],
     ):
@@ -366,6 +385,7 @@ class NLayerDiscriminator(nn.Module):
 
     def forward(self, input):
         return self.model(input)
+
 
 class UnetSkipConnectionBlock(nn.Module):
     """Defines the Unet submodule with skip connection.
@@ -442,11 +462,18 @@ class UnetSkipConnectionBlock(nn.Module):
         else:  # add skip connections
             return torch.cat([x, self.model(x)], 1)
 
+
 class UnetGenerator(nn.Module):
     """Create a Unet-based generator"""
 
     def __init__(
-        self, input_nc=1, output_nc=1, num_downs=8, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False
+        self,
+        input_nc=1,
+        output_nc=1,
+        num_downs=8,
+        ngf=64,
+        norm_layer=nn.BatchNorm2d,
+        use_dropout=False,
     ):
         """Construct a Unet generator
         Parameters:
@@ -496,9 +523,12 @@ class UnetGenerator(nn.Module):
     def forward(self, input):
         """Standard forward"""
         return self.model(input)
+
+
 if __name__ == "__main__":
 
-    gen_model = ResnetGenerator(input_nc=1, output_nc=1)
+    # gen_model = UnetGenerator(num_downs=8)
+    gen_model = ResnetGenerator(n_blocks=9)
 
     batch_size = 4
     channels = 1
@@ -507,3 +537,7 @@ if __name__ == "__main__":
     random_tensors = torch.randn(batch_size, channels, height, width)
     geneerate_image = gen_model(random_tensors)
     print(geneerate_image.shape)
+    discriminator = NLayerDiscriminator(n_layers=6)
+    discriminator = CycleDis(random_tensors.shape[1:])
+    output = discriminator(random_tensors)
+    print(output.shape)

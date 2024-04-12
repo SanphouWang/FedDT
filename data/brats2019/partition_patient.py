@@ -176,13 +176,13 @@ def add_argument():
     parser.add_argument(
         "--slice_idx_begin",
         type=int,
-        default=60,
+        default=40,
         help="beginning slice index, each volume in Brats2019 has 155 slices",
     )
     parser.add_argument(
         "--slice_idx_end",
         type=int,
-        default=80,
+        default=100,
         help="ending slice index, each volume in Brats2019 has 155 slices",
     )
     args = parser.parse_args()

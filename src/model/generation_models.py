@@ -20,30 +20,40 @@ from torch.optim.lr_scheduler import LambdaLR
 PROJECT_DIR = Path(__file__).parent.parent.parent.absolute()
 sys.path.append(PROJECT_DIR.as_posix())
 
-from src.utils.basic_models import (
+from src.model.basic_models import (
     CycleDis,
     CycleGen,
     ResnetGenerator,
     NLayerDiscriminator,
     UnetGenerator,
 )
-
+from src.model.big_unet_generator import BigUNetGenerator
 from src.utils.tools import move2cpu, move2device
 
 
 class CycleGAN:
-    def __init__(self, args, device, dataloader, mode="train") -> None:
+    def __init__(
+        self,
+        args,
+        device,
+        dataloader,
+        logger,
+        mode="train",
+    ) -> None:
         self.args = args
         self.device = device
         self.dataloader = dataloader
         self.mode = mode
+        self.logger = logger
         # generators, discriminators and optimizers
         # self.cyclegen_021 = CycleGen()  # generate from modality0 to modality1
         # self.cyclegen_120 = CycleGen()  # generate from modality1 to modality0
-        # self.cyclegen_021 = ResnetGenerator(1, 1)
-        # self.cyclegen_120 = ResnetGenerator(1, 1)
-        self.cyclegen_021 = UnetGenerator()
-        self.cyclegen_120 = UnetGenerator()
+        self.cyclegen_021 = ResnetGenerator(n_blocks=9)
+        self.cyclegen_120 = ResnetGenerator(n_blocks=9)
+        # self.cyclegen_021 = BigUNetGenerator()
+        # self.cyclegen_120 = BigUNetGenerator()
+        # self.cyclegen_021 = UnetGenerator()
+        # self.cyclegen_120 = UnetGenerator()
         self.optimizer_cyclegen_021 = torch.optim.Adam(
             self.cyclegen_021.parameters(),
             lr=self.args.gen_lr,
@@ -56,7 +66,9 @@ class CycleGAN:
         )
 
         def lambda_rule(epoch):
-            lr_l = 1.0 - max(0, epoch - 20) / float(self.args.gen_round - 20 + 1)
+            lr_l = 1.0 - max(0, epoch - self.args.gen_samelr_round) / float(
+                self.args.gen_round - self.args.gen_samelr_round + 1
+            )
             return lr_l
 
         self.shcheduler = [
@@ -70,8 +82,8 @@ class CycleGAN:
             # self.cycledis_1 = CycleDis(
             #     input_shape=self.dataloader.dataset.image_shape
             # )  # discriminate fake modality1 from true image
-            self.cycledis_0 = NLayerDiscriminator()
-            self.cycledis_1 = NLayerDiscriminator()
+            self.cycledis_0 = NLayerDiscriminator(n_layers=6)
+            self.cycledis_1 = NLayerDiscriminator(n_layers=6)
             self.optimizer_cycledis_0 = torch.optim.Adam(
                 self.cycledis_0.parameters(),
                 lr=self.args.dis_lr,
@@ -88,6 +100,8 @@ class CycleGAN:
             ]
             # self.output_shape = self.cycledis_0.output_shape
         self.dis_train_epoch = 0
+        self.generate_image_flag = False
+        self.current_step = 1
 
     def generate_indices(self, batch):
         return self.dataloader.dataset.generate_indices(self.args, batch)
@@ -116,9 +130,50 @@ class CycleGAN:
         return_dict["discrimination_loss"] = loss_discrimination_cache / len(self.dataloader)
         return return_dict
 
+    def eval_generator(
+        self,
+    ):
+        self.cyclegen_021.eval()
+        self.cyclegen_120.eval()
+        self.cycledis_0.eval()
+        self.cycledis_1.eval()
+        loss_generation_cache = {}
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.dataloader):
+                loss_generation: Dict = self.gen_loss(batch, evaluate_training=True)
+                if batch_idx == 0:
+                    for key in loss_generation.keys():
+                        loss_generation_cache[key] = loss_generation[key]
+                else:
+                    for key in loss_generation.keys():
+                        loss_generation_cache[key] += loss_generation[key]
+        for key in loss_generation_cache.keys():
+            loss_generation_cache[key] = loss_generation_cache[key] / len(self.dataloader)
+        return loss_generation_cache
+
+    def eval_discriminator(
+        self,
+    ):
+        self.cyclegen_021.eval()
+        self.cyclegen_120.eval()
+        self.cycledis_0.eval()
+        self.cycledis_1.eval()
+        loss_discrimination_cache = 0.0
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.dataloader):
+                loss_discrimination = self.dis_loss(batch)
+                loss_discrimination_cache += loss_discrimination
+        return {"discriminator_loss": loss_discrimination_cache / len(self.dataloader)}
+
     def update_learning_rate(self):
+        update_flag = 1
+
         for scheduler in self.shcheduler:
+            old_lr = scheduler.get_last_lr()
             scheduler.step()
+            new_lr = scheduler.get_last_lr()
+            if old_lr != new_lr:
+                self.logger.log("Update learning rate to " + str(scheduler.get_last_lr()))
 
     def train_epoch(self):
         loss_generation_cache = 0.0
@@ -127,11 +182,20 @@ class CycleGAN:
         """
         Train Generators
         """
+        if self.args.gen_eval_train and self.current_step % 10 == 0:
+            gen_before_trian = self.eval_generator()
+            self.logger.log(f"Generator Before Training")
+            self.logger.log(
+                " ".join(
+                    [f"{key}: {float(value):.5f}. " for key, value in gen_before_trian.items()]
+                )
+            )
+
+        self.cyclegen_021.train()
+        self.cyclegen_120.train()
+        self.cycledis_0.eval()
+        self.cycledis_1.eval()
         for batch_idx, batch in enumerate(self.dataloader):
-            self.cyclegen_021.train()
-            self.cyclegen_120.train()
-            self.cycledis_0.eval()
-            self.cycledis_1.eval()
             loss_generation = self.gen_loss(batch)
             loss_generation_cache += loss_generation.item()
             self.optimizer_cyclegen_021.zero_grad()
@@ -139,16 +203,29 @@ class CycleGAN:
             loss_generation.backward()
             self.optimizer_cyclegen_021.step()
             self.optimizer_cyclegen_120.step()
+        if self.args.gen_eval_train and self.current_step % 10 == 0:
+            gen_after_train = self.eval_generator()
+            self.logger.log("Generator After Training")
+            self.logger.log(
+                " ".join([f"{key}: {float(value):.5f}. " for key, value in gen_after_train.items()])
+            )
+            dis_before_train = self.eval_discriminator()
+            self.logger.log("Discriminator Before Training")
+            self.logger.log(
+                " ".join(
+                    [f"{key}: {float(value):.5f}. " for key, value in dis_before_train.items()]
+                )
+            )
 
-            """
-            Train Discriminator
-            """
+        """
+        Train Discriminator
+        """
+        self.cyclegen_021.eval()
+        self.cyclegen_120.eval()
+        self.cycledis_0.train()
+        self.cycledis_1.train()
         if self.dis_train_epoch % self.args.dis_train_gap == 0:
             for batch_idx, batch in enumerate(self.dataloader):
-                self.cyclegen_021.eval()
-                self.cyclegen_120.eval()
-                self.cycledis_0.train()
-                self.cycledis_1.train()
                 loss_discrimination = self.dis_loss(batch)
                 loss_discrimination_cache += loss_discrimination.item()
                 self.optimizer_cycledis_0.zero_grad()
@@ -158,7 +235,17 @@ class CycleGAN:
                 self.optimizer_cycledis_1.step()
             loss_discrimination_cache = loss_discrimination_cache / len(self.dataloader)
             loss_generation_cache = loss_generation_cache / len(self.dataloader)
+            if self.args.gen_eval_train and self.current_step % 10 == 0:
+                dis_after_train = self.eval_discriminator()
+                self.logger.log("Discriminator After Training")
+                self.logger.log(
+                    " ".join(
+                        [f"{key}: {float(value):.5f}. " for key, value in dis_after_train.items()]
+                    )
+                )
+
         self.dis_train_epoch += 1
+        self.current_step += 1
         return {
             "generation_loss": loss_generation_cache,
             "discrimination_loss": loss_discrimination_cache,
@@ -250,15 +337,6 @@ class CycleGAN:
                 -1, 1, modality0_volumes.shape[2], modality0_volumes.shape[3]
             ).to(self.device)
             fake_modality1 = self.cyclegen_021(real_modality0)
-            # fake_modality1 = fake_modality1
-            # valid = Variable(
-            #     torch.ones((real_modality0.size(0), *self.output_shape)),
-            #     requires_grad=False,
-            # ).to(self.device)
-            # fake = Variable(
-            #     torch.zeros((real_modality0.size(0), *self.output_shape)),
-            #     requires_grad=False,
-            # ).to(self.device)
             loss_fake_1 = criterion_GAN(self.cycledis_1(fake_modality1), False)
             loss_real_0 = criterion_GAN(self.cycledis_0(real_modality0), True)
         # if this batch has modality 1
@@ -266,35 +344,13 @@ class CycleGAN:
             real_modality1 = modality1_volumes.view(
                 -1, 1, modality1_volumes.shape[2], modality1_volumes.shape[3]
             ).to(self.device)
-            # fake_modality0 = fake_modality0
             fake_modality0 = self.cyclegen_120(real_modality1)
-            # valid = Variable(
-            #     torch.ones((real_modality1.size(0), *self.output_shape)),
-            #     requires_grad=False,
-            # ).to(self.device)
-            # fake = Variable(
-            #     torch.zeros((real_modality1.size(0), *self.output_shape)),
-            #     requires_grad=False,
-            # ).to(self.device)
             loss_fake_0 = criterion_GAN(self.cycledis_0(fake_modality0), False)
             loss_real_1 = criterion_GAN(self.cycledis_1(real_modality1), True)
-        loss_discrimination = loss_fake_0 + loss_fake_1 + loss_real_0 + loss_real_1
+        loss_discrimination = 0.5 * (loss_fake_0 + loss_fake_1 + loss_real_0 + loss_real_1)
         return loss_discrimination
 
     def move2cpu(self):
-        # if isinstance(self.cyclegen_021, torch.nn.DataParallel):
-        #     self.cyclegen_021 = self.cyclegen_021.module
-        # if isinstance(self.cyclegen_120, torch.nn.DataParallel):
-        #     self.cyclegen_120 = self.cyclegen_120.module
-        # self.cyclegen_120.cpu()
-        # self.cyclegen_021.cpu()
-        # if self.mode == "train":
-        #     if isinstance(self.cycledis_0, torch.nn.DataParallel):
-        #         self.cycledis_0 = self.cycledis_0.module
-        #     if isinstance(self.cycledis_1, torch.nn.DataParallel):
-        #         self.cycledis_1 = self.cycledis_1.module
-        #     self.cycledis_0.cpu()
-        #     self.cycledis_1.cpu()
         self.cyclegen_021 = move2cpu(self.cyclegen_021)
         self.cyclegen_120 = move2cpu(self.cyclegen_120)
         if self.mode == "train":
@@ -317,11 +373,19 @@ class CycleGAN:
         ]
 
     def download_weights(self, weights: List[OrderedDict], resume=False):
-        self.cyclegen_120.load_state_dict(weights[0])
-        self.cyclegen_021.load_state_dict(weights[1])
+        try:
+            self.cyclegen_120.load_state_dict(weights[0])
+            self.cyclegen_021.load_state_dict(weights[1])
+        except:
+            raise Warning("Fail to resume generator weights. Will use default weights")
+            pass
         if (self.args.upload_dis and self.mode == "train") or resume:
-            self.cycledis_0.load_state_dict(weights[2])
-            self.cycledis_1.load_state_dict(weights[3])
+            try:
+                self.cycledis_0.load_state_dict(weights[2])
+                self.cycledis_1.load_state_dict(weights[3])
+            except:
+                raise Warning("Fail to resume discriminator weights. Will use default weights")
+                pass
 
     def get_generator(self):
         return self.cyclegen_021, self.cyclegen_120
@@ -403,16 +467,22 @@ class CycleGAN:
             plt.savefig(f"{out_dir}/{metric_name}.png")
 
     def generate_image(self, out_dir):
+
         if not os.path.exists(out_dir):
             os.makedirs(out_dir)
-
+        if self.generate_image_flag == False:
+            self.generate_image_flag = True
+            self.batch4generating_image = next(iter(self.dataloader))
+            self.slice_idx4generating_image = random.sample(
+                range((self.args.slice_idx_end - self.args.slice_idx_begin)),
+                4,
+            )
         self.cyclegen_021.eval()
         self.cyclegen_120.eval()
         with torch.no_grad():
-
-            batch = next(iter(self.dataloader))
-            real_modality0 = batch["modality0"].to(self.device)
-            real_modality1 = batch["modality1"].to(self.device)
+            batch = self.batch4generating_image
+            real_modality0 = batch["modality0"]
+            real_modality1 = batch["modality1"]
             real_modality0 = real_modality0.view(
                 -1, 1, real_modality0.shape[2], real_modality0.shape[3]
             ).to(self.device)
@@ -422,11 +492,10 @@ class CycleGAN:
             fake_modality1 = self.cyclegen_021(real_modality0)
             fake_modality0 = self.cyclegen_120(real_modality1)
             # randomly select 4 slices
-            slice_idx = random.sample(range(real_modality0.shape[0]), 4)
-            real_modality0 = real_modality0[slice_idx]
-            real_modality1 = real_modality1[slice_idx]
-            fake_modality1 = fake_modality1[slice_idx]
-            fake_modality0 = fake_modality0[slice_idx]
+            real_modality0 = real_modality0[self.slice_idx4generating_image]
+            real_modality1 = real_modality1[self.slice_idx4generating_image]
+            fake_modality1 = fake_modality1[self.slice_idx4generating_image]
+            fake_modality0 = fake_modality0[self.slice_idx4generating_image]
             for i in range(4):
                 fig, axs = plt.subplots(1, 4, figsize=(12, 6))
                 # for modality in [real_modality0, real_modality1, fake_modality1, fake_modality0]:

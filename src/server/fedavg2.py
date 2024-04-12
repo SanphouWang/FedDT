@@ -21,6 +21,7 @@ import torch.nn as nn
 
 PROJECT_DIR = Path(__file__).parent.parent.parent.absolute()
 sys.path.append(PROJECT_DIR.as_posix())
+
 from data.utils.datasets import DATASETS
 
 from src.utils.tools import (
@@ -33,7 +34,7 @@ from src.utils.tools import (
     move2device,
 )
 from src.model.model_tools import get_model_arch
-from src.client.fedavg import FedAvgClient
+from src.client.fedavg2 import FedAvgClient
 
 
 def local_time():
@@ -91,13 +92,13 @@ def get_fedavg_argparser():
         "--dis-lr", type=float, default=0.0002, help="Learning rate for the discriminator"
     )
     parser.add_argument(
-        "--gen-batch-size", type=int, default=1, help="Batch size for the generation model."
+        "--gen-batch-size", type=int, default=3, help="Batch size for the generation model."
     )
     parser.add_argument(
         "--gen-test-gap", "-gtg", type=int, default=2, help="The gap between two test rounds"
     )
     parser.add_argument(
-        "--upload-dis", type=bool, default=False, help="whether to upload discriminator weights"
+        "--upload-dis", type=bool, default=True, help="whether to upload discriminator weights"
     )
     parser.add_argument(
         "--gen-eval-train",
@@ -148,16 +149,16 @@ def get_fedavg_argparser():
     parser.add_argument(
         "--class-model",
         type=str,
-        default="resnet50",
+        default="resnet_mixed_conv",
         help="Model architecture for the classification task.",
     )
     parser.add_argument(
-        "--class-batchsize", type=int, default=2, help="Batch size for the classification model."
+        "--class-batch-size", type=int, default=5, help="Batch size for the classification model."
     )
     parser.add_argument(
         "--class-epochs",
         type=int,
-        default=30,
+        default=5,
         help="Number of local training epochs for the classification model.",
     )
     parser.add_argument(
@@ -167,7 +168,10 @@ def get_fedavg_argparser():
         help="Number of local training epochs for the classification model.",
     )
     parser.add_argument(
-        "--class-lr", type=float, default=0.001, help="Learning rate for the classification model."
+        "--class-lr",
+        type=float,
+        default=0.0001,
+        help="Learning rate for the classification model.",
     )
     parser.add_argument("--momentum", type=float, default=0.9, help="momentum for SGD")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="weight decay for SGD")
@@ -233,84 +237,107 @@ class FedAvgServer:
         self.test_result_list: List[Dict] = []  # store test result of each test round
 
         """
-        initialize device, client, test dataset and validation dataset
-        initialize generation model for test and validation
+        Initialize Dataset and Client
         """
-        self.device = get_best_device(self.args.use_cuda)
-        self.client = FedAvgClient(self.args, self.device, self.logger)
-        # initialize test dataset and validation dataset
-        self.transform = ToTensor()
-
-        """
-        Test and Validation
-        """
-        self.dataset_class = DATASETS[self.args.dataset]
-        self.test_dataset = DATASETS[self.args.dataset](self.args, test_valid="test")
-        self.test_loader = DataLoader(
-            self.test_dataset, batch_size=max(1, round(self.args.gen_batch_size / 2)), shuffle=False
+        # Dataset
+        self.generation_dataset_train = [
+            DATASETS[self.args.dataset](self.args, client_id=i) for i in range(self.args.client_num)
+        ]
+        self.generation_dataset_test = DATASETS[self.args.dataset](self.args, client_id="test")
+        self.generation_dataloader_test = DataLoader(
+            self.generation_dataset_test, batch_size=self.args.gen_batch_size, shuffle=False
         )
-        self.gen_model_test = get_model_arch(self.args.gen_model)(
-            self.args, self.device, self.test_loader, self.logger, mode="test"
+        self.classification_dataset_train = [
+            DATASETS[self.args.dataset](self.args, client_id=i) for i in range(self.args.client_num)
+        ]
+        self.classification_dataset_test = DATASETS[self.args.dataset](self.args, client_id="test")
+        self.classification_dataloader_test = DataLoader(
+            self.classification_dataset_test, batch_size=self.args.class_batch_size, shuffle=False
         )
-        self.class_model_test = get_model_arch(self.args.class_model)(self.args)
-        if self.args.gen_valid or self.args.class_valid:
-            self.valid_dataset = DATASETS[self.args.dataset](self.args, test_valid="valid")
-            self.valid_loader = DataLoader(
-                self.valid_dataset,
-                batch_size=max(1, round(self.args.gen_batch_size / 2)),
+        if self.args.gen_valid:
+            self.generation_dataset_valid = DATASETS[self.args.dataset](
+                self.args, client_id="valid"
+            )
+            self.generation_dataloader_valid = DataLoader(
+                self.generation_dataset_valid, batch_size=self.args.gen_batch_size, shuffle=False
+            )
+        if self.args.class_valid:
+            self.classification_dataset_valid = DATASETS[self.args.dataset](
+                self.args, client_id="valid"
+            )
+            self.classification_dataloader_valid = DataLoader(
+                self.classification_dataset_valid,
+                batch_size=self.args.class_batch_size,
                 shuffle=False,
             )
-            if self.args.gen_valid:
-                self.gen_model_valid = get_model_arch(self.args.gen_model)(
-                    self.args, self.device, self.valid_loader, self.logger, mode="test"
-                )
+        # Client & Model
+        self.client_list = [
+            FedAvgClient(self.args, self.generation_dataset_train[i], self.logger)
+            for i in range(self.args.client_num)
+        ]
+        self.device = get_best_device(self.args.use_cuda)
+        self.generation_model = get_model_arch(self.args.gen_model)(
+            self.args, self.logger, self.device
+        )  # model for test
+        self.classification_model = get_model_arch(self.args.class_model)()
 
     def generation_workflow(self):
         # train generation model
         self.gen_round_begin = 0
         if self.args.gen_resume:
             self.gen_resume()
+        # calculate weights for each client for model aggregation
+        client_datanum_list = [len(dataset) for dataset in self.generation_dataset_train]
+        total_datanum = sum(client_datanum_list)
+        client_weights_list = [datanum / total_datanum for datanum in client_datanum_list]
         for round_idx in range(self.gen_round_begin, self.args.gen_round):
+            client_generation_model_weights_list: List[List[OrderedDict]] = []
             self.logger.log("=" * 20, "Round:", round_idx, "Generation Start Training", "=" * 20)
+            # train generation model on each client
             for client_idx in range(self.args.client_num):
-                self.client.gen_train_model(client_idx)
+                self.logger.log(local_time(), " Client", client_idx, "Training Start")
+                self.client_list[client_idx].generation_workflow(round_idx)
+                client_generation_model_weights_list.append(
+                    self.client_list[client_idx].get_generation_model_weights()
+                )
 
-            client_weights_list = self.client.get_client_weights()
-            model_dict_list_list = self.client.gen_get_model_weights()
-            aggregated_model_dict_list = self.gen_aggreation(
-                model_dict_list_list, client_weights_list
+            aggregated_model_weights = self.gen_aggreation(
+                client_generation_model_weights_list, client_weights_list
             )
+
+            for client_idx in range(self.args.client_num):
+                self.client_list[client_idx].load_generation_model_weights(aggregated_model_weights)
             if self.args.gen_save_checkpoint:
-                self.gen_save_checkpoint(round_idx, aggregated_model_dict_list)
-            self.client.gen_download_model(aggregated_model_dict_list)
+                self.gen_save_checkpoint(round_idx, aggregated_model_weights)
+
             # valid and test generation model
             if (round_idx + 1) % self.args.gen_test_gap == 0:
-                self.gen_valid_test(aggregated_model_dict_list)
+                self.gen_valid_test(aggregated_model_weights)
                 self.generate_image()
+
         self.gen_plot_test_result()
 
     def generate_image(self):
         # generate some images from test set by the trained generation model
-        self.gen_model_test.move2device()
-        self.gen_model_test.generate_image(os.path.join(self.out_dir, "generated_image"))
-        self.gen_model_test.move2cpu()
+        self.generation_model.move2device()
+        self.generation_model.generate_image(
+            os.path.join(self.out_dir, "generated_image"), self.generation_dataloader_test
+        )
+        self.generation_model.move2cpu()
 
     def gen_valid_test(self, aggregated_model_dict_list):
         # process validation and test
         with torch.no_grad():
+            self.generation_model.download_weights(aggregated_model_dict_list)
+            self.generation_model.move2device()
             if self.args.gen_valid:
-                self.gen_model_valid.download_weights(aggregated_model_dict_list)
-                self.gen_model_valid.move2device()
-                valid_result: Dict = self.gen_model_valid.test()
-                self.gen_model_valid.move2cpu()
+                valid_result: Dict = self.generation_model.test(self.generation_dataloader_valid)
                 self.logger.log("Validation Result")
                 for key, value in valid_result.items():
                     self.logger.log(f"{key}: {value:.4f}")
-            self.gen_model_test.download_weights(aggregated_model_dict_list)
-            self.gen_model_test.move2device()
-            test_result: Dict = self.gen_model_test.test()
+            test_result: Dict = self.generation_model.test(self.generation_dataloader_test)
             self.test_result_list.append(test_result)
-            self.gen_model_test.move2cpu()
+            self.generation_model.move2cpu()
             self.logger.log("Test Result")
             for key, value in test_result.items():
                 self.logger.log(f"{key}: {value:.4f}")
@@ -322,7 +349,7 @@ class FedAvgServer:
         test_rounds = range(
             self.gen_round_begin + 1, self.args.gen_round + 1, self.args.gen_test_gap
         )
-        self.gen_model_test.plot_test_result(self.test_result_list, test_rounds, path)
+        self.generation_model.plot_test_result(self.test_result_list, test_rounds, path)
 
     def gen_aggreation(self, model_dict_list_list, client_weights_list) -> List[OrderedDict]:
         # aggregate model weights according to the weights of each client
@@ -357,67 +384,124 @@ class FedAvgServer:
         if not self.args.only_resume_model:
             self.gen_round_begin = checkpoint["round"] + 1
         aggregated_model_dict_list = checkpoint["model_state_dict_list"]
-        self.client.gen_download_model(aggregated_model_dict_list, resume=True)
+        for client in self.client_list:
+            client.load_generation_model_weights(aggregated_model_dict_list, resume=True)
 
     def classification_workflow(self):
+        client_datanum_list = [len(dataset) for dataset in self.classification_dataset_train]
+        total_datanum = sum(client_datanum_list)
+        client_weights_list = [datanum / total_datanum for datanum in client_datanum_list]
         for round_idx in range(self.args.class_round):
+            client_classification_model_weights_list: List[List[OrderedDict]] = []
             self.logger.log(
                 "=" * 20, "Round:", round_idx, "Classification Start Training", "=" * 20
             )
             for client_idx in range(self.args.client_num):
-                self.client.class_train_model(client_idx)
-                self.logger.log("Client", client_idx, "Training Finished")
-            client_weights_list = self.client.get_client_weights()
-            model_dict_list_list = self.client.class_get_model_weights()
-            aggregated_model_dict_list = self.gen_aggreation(
-                model_dict_list_list, client_weights_list
+                self.logger.log("Client", client_idx, "Begin")
+                self.client_list[client_idx].classification_workflow()
+                client_classification_model_weights_list.append(
+                    self.client_list[client_idx].get_classification_model_weights()
+                )
+
+            aggregated_model_weights = self.gen_aggreation(
+                client_classification_model_weights_list, client_weights_list
             )
-            self.client.class_download_model(aggregated_model_dict_list)
+
+            for client_idx in range(self.args.client_num):
+                self.client_list[client_idx].load_classification_model_weights(
+                    aggregated_model_weights
+                )
             if (round_idx + 1) % self.args.class_test_gap == 0:
-                self.class_model_test.load_state_dict(aggregated_model_dict_list[0])
+                self.classification_model.load_state_dict(aggregated_model_weights[0])
                 self.class_valid_test()
 
         pass
 
     def class_valid_test(self):
-        self.class_model_test = move2device(self.device, self.args.multi_gpu, self.class_model_test)
-        self.class_model_test.eval()
+        self.classification_model = move2device(
+            self.device, self.args.multi_gpu, self.classification_model
+        )
+        self.classification_model.eval()
         with torch.no_grad():
+            criterion = nn.CrossEntropyLoss(weight=torch.tensor([1, 3.54]).to(self.device))
             if self.args.class_valid:
                 loss = 0.0
                 accurate_num = 0
                 total_num = 0
-                for batch in self.valid_loader:
-                    image, label = self.dataset_class.class_organize_batch(
+                confusion_matrix = torch.zeros(
+                    self.classification_dataset_valid.num_classes,
+                    self.classification_dataset_valid.num_classes,
+                )
+
+                for batch in self.classification_dataloader_valid:
+                    image, label = self.classification_dataset_valid.class_organize_batch(
                         batch, self.args, self.device
                     )
-                    output = self.class_model_test(image)
+                    image = image.to(self.device)
+                    label = label.to(self.device)
+                    output = self.classification_model(image)
                     predictions = torch.argmax(output, dim=1)
                     accurate_num += (predictions == label).sum().item()
                     total_num += label.size(0)
-                    loss += nn.functional.cross_entropy(output, label).item()
+                    loss += criterion(output, label).item()
+                    for i in range(predictions.size(0)):
+                        true_label = label[i].item()
+                        predicted_label = predictions[i].item()
+                        confusion_matrix[true_label][predicted_label] += 1
+                precision = torch.diag(confusion_matrix) / confusion_matrix.sum(dim=0)
+                recall = torch.diag(confusion_matrix) / confusion_matrix.sum(dim=1)
+                f1 = 2 * precision * recall / (precision + recall)
+                accuracy = (torch.diag(confusion_matrix).sum() / confusion_matrix.sum()).item()
+                self.logger.log(f"Confusion matrix:{confusion_matrix.tolist()}")
+                self.logger.log(f"Precision: {precision.tolist()}")
+                self.logger.log(f"Recall: {recall.tolist()}")
+                self.logger.log(f"F1: {f1.tolist()}")
+                self.logger.log("Validation Average Accuracy: {:.4f}%".format(100 * accuracy))
                 self.logger.log(
-                    "Validation Average Accuracy: {:.4f}%".format(100 * accurate_num / total_num)
-                )
-                self.logger.log(
-                    "Validation Average Loss: {:.4f}".format(loss / len(self.valid_loader))
+                    "Validation Average Loss: {:.4f}".format(
+                        loss / len(self.classification_dataloader_valid)
+                    )
                 )
 
             loss = 0.0
             accurate_num = 0
             total_num = 0
-            for batch in self.test_loader:
-                image, label = self.dataset_class.class_organize_batch(
+            confusion_matrix = torch.zeros(
+                self.classification_dataset_valid.num_classes,
+                self.classification_dataset_valid.num_classes,
+            )
+            for batch in self.classification_dataloader_test:
+
+                image, label = self.classification_dataset_test.class_organize_batch(
                     batch, self.args, self.device
                 )
-                output = self.class_model_test(image)
+                image = image.to(self.device)
+                label = label.to(self.device)
+                output = self.classification_model(image)
                 predictions = torch.argmax(output, dim=1)
                 accurate_num += (predictions == label).sum().item()
                 total_num += label.size(0)
-                loss += nn.functional.cross_entropy(output, label).item()
-            self.logger.log("Test Average Accuracy: {:.4f}%".format(100 * accurate_num / total_num))
-            self.logger.log("Test Average Loss: {:.4f}".format(loss / len(self.test_loader)))
-            self.class_model_test = move2cpu(self.class_model_test)
+                loss += criterion(output, label).item()
+                for i in range(predictions.size(0)):
+                    true_label = label[i].item()
+                    predicted_label = predictions[i].item()
+                    confusion_matrix[true_label][predicted_label] += 1
+            precision = torch.diag(confusion_matrix) / confusion_matrix.sum(dim=0)
+            recall = torch.diag(confusion_matrix) / confusion_matrix.sum(dim=1)
+            f1 = 2 * precision * recall / (precision + recall)
+            accuracy = (torch.diag(confusion_matrix).sum() / confusion_matrix.sum()).item()
+            self.logger.log(
+                "Validation Average Accuracy: {:.4f}%".format(100 * accurate_num / total_num)
+            )
+            self.logger.log(f"Confusion matrix:{confusion_matrix.tolist()}")
+            self.logger.log(f"Precision: {precision.tolist()}")
+            self.logger.log(f"Recall: {recall.tolist()}")
+            self.logger.log(f"F1: {f1.tolist()}")
+            self.logger.log("Test Average Accuracy: {:.4f}%".format(100 * accuracy))
+            self.logger.log(
+                "Test Average Loss: {:.4f}".format(loss / len(self.classification_dataloader_test))
+            )
+            self.classification_model = move2cpu(self.classification_model)
 
     def run(self):
         pass
@@ -431,7 +515,7 @@ class FedAvgServer:
 
 if __name__ == "__main__":
     server = FedAvgServer()
-    # server.args.debug = True
+    server.args.debug = True
     if server.args.debug:
         server.debug()
     else:
