@@ -16,13 +16,14 @@ from torch.utils.data import DataLoader
 import numpy as np
 from rich.console import Console
 from rich.progress import track
-
+from multiprocessing import Manager
+from ray.util.multiprocessing import Pool
 import torch.nn as nn
 
 PROJECT_DIR = Path(__file__).parent.parent.parent.absolute()
 sys.path.append(PROJECT_DIR.as_posix())
 
-from data.utils.datasets import DATASETS
+from data.utils.datasets import CALLATE_FNC, DATASETS
 
 from src.utils.tools import (
     OUT_DIR,
@@ -49,79 +50,116 @@ def get_fedavg_argparser():
     parser = ArgumentParser(description="FedAvg Server")
 
     # basic parameters
-    parser.add_argument("-d", "--dataset", type=str, default="brats2019", help="dataset to use")
+    parser.add_argument(
+        "-d",
+        "--dataset",
+        choices=["brats2019", "adni_roi"],
+        type=str,
+        default="adni_roi",
+        help="dataset to use",
+    )
     parser.add_argument("-s", "--seed-server", type=int, default=42, help="random seed")
     parser.add_argument("--use-cuda", type=int, default=1)
-    parser.add_argument("--multi-gpu", type=bool, default=True, help="whether to use multi-gpu")
+    parser.add_argument("--multi-gpu", type=bool, default=False, help="whether to use multi-gpu")
     parser.add_argument("--save_log", type=int, default=1)
     parser.add_argument("--debug", default=False, type=bool, help="whether to debug the code")
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="classification/fortest/",
+        help="output directory",
+    )
+    parser.add_argument(
+        "--task", choices=["classification", "generation"], default="generation", type=str
+    )
+    parser.add_argument("--log-name", default="class", type=str)
+    parser.add_argument(
+        "--preprocessed-file-directory",
+        default="/mnt/hardDisk1/wwmm/sanphou/FedDT/out/Centralized/adni_roi/2024-06-03-10:27:49/classification/k=3/ratio_both=0.8/sigma=0.2/without_generator/checkpoint/classifier1.pt",
+        type=str,
+    )
     """
     # parameters for generation
     """
+    # parser.add_argument(
+    #     "--embed-p2p", type=bool, default=False, help="Whether to embed pixel2pixel method"
+    # )
+
     parser.add_argument(
         "--gen-valid", "-gv", default=False, type=bool, help="whether to use validation set"
     )
     parser.add_argument(
         "--gen-model",
         type=str,
-        default="cyclegan",
+        default="pixel2pixel",
+        choices=["cyclegan", "pixel2pixel"],
         help="Model architecture for the generation task.",
     )
     parser.add_argument(
         "--gen-round",
         type=int,
-        default=50,
+        default=10,
         help="Number of global rounds for the generation task.",
     )
     parser.add_argument(
         "--gen-samelr-round",
         type=int,
-        default=20,
+        default=10,
         help="Number of rounds with the same learning rate",
     )
     parser.add_argument(
         "--gen-epochs",
         type=int,
-        default=1,
+        default=5,
         help="Number of local training epochs for the generation model.",
     )
     parser.add_argument(
-        "--gen-lr", type=float, default=0.0002, help="Learning rate for the generator."
+        "--gen-lr", type=float, default=0.001, help="Learning rate for the generator."
     )
     parser.add_argument(
-        "--dis-lr", type=float, default=0.0002, help="Learning rate for the discriminator"
+        "--dis-lr", type=float, default=0.001, help="Learning rate for the discriminator"
     )
     parser.add_argument(
-        "--gen-batch-size", type=int, default=3, help="Batch size for the generation model."
+        "--gen-batch-size", type=int, default=32, help="Batch size for the generation model."
     )
     parser.add_argument(
-        "--gen-test-gap", "-gtg", type=int, default=2, help="The gap between two test rounds"
+        "--gen-test-gap", "-gtg", type=int, default=1, help="The gap between two test rounds"
     )
+    # parser.add_argument('--gen-opt',choices=['adam', 'sgd'],default='sgd')
     parser.add_argument(
-        "--upload-dis", type=bool, default=True, help="whether to upload discriminator weights"
+        "--upload-dis", type=bool, default=False, help="whether to upload discriminator weights"
     )
     parser.add_argument(
         "--gen-eval-train",
-        default=True,
-        type=bool,
+        default=10,
+        type=int,
         help="whether to evaluate the generation model on the training set",
     )
     parser.add_argument("--gen-beta1", type=float, default=0.5, help="parameter for Adam")
     parser.add_argument("--gen-beta2", type=float, default=0.999, help="parameter for Adam")
     parser.add_argument(
-        "--lambda-gan", type=float, default=1, help="parameter for the GAN loss function"
+        "--lambda-gan", type=float, default=5, help="parameter for the GAN loss0 function"
     )
     parser.add_argument(
         "--lambda-identity",
         type=float,
-        default=10.0,
+        default=0.0,
         help="parameter for the identity loss function",
     )
     parser.add_argument(
         "--lambda-cycle", type=float, default=100.0, help="parameter for the cycle loss function"
     )
     parser.add_argument(
-        "--lambda_paired", type=float, default=0.0, help="use paired loss for better generation"
+        "--lambda-paired", type=float, default=10, help="use paired loss for better generation"
+    )
+    parser.add_argument(
+        "--lambda-pixel",
+        type=float,
+        default=100.0,
+        help="parameter for the pixel loss function in pexel2pixel",
+    )
+    parser.add_argument(
+        "--lambda-label", default=50, type=float, help="parameter for the label loss function"
     )
     parser.add_argument(
         "--gen-save-checkpoint",
@@ -142,6 +180,12 @@ def get_fedavg_argparser():
         type=bool,
         help="whether to only resume the model weights",
     )
+    parser.add_argument(
+        "--embed-label",
+        default=True,
+        type=bool,
+        help="whether embed label discriminator into the training process of gernerator",
+    )
     """
     # paramters for classification
     """
@@ -149,28 +193,35 @@ def get_fedavg_argparser():
     parser.add_argument(
         "--class-model",
         type=str,
-        default="resnet_mixed_conv",
+        choices=["dualmodalitymlp", "mlp_classifier"],
+        default="mlp_classifier",
         help="Model architecture for the classification task.",
     )
     parser.add_argument(
-        "--class-batch-size", type=int, default=5, help="Batch size for the classification model."
+        "--class-batch-size", type=int, default=128, help="Batch size for the classification model."
+    )
+    parser.add_argument(
+        "--lr-same-epochs",
+        default=100,
+        type=int,
+        help="Number of epochs with the same initial learning rate",
     )
     parser.add_argument(
         "--class-epochs",
         type=int,
-        default=5,
+        default=200,
         help="Number of local training epochs for the classification model.",
     )
     parser.add_argument(
         "--class-round",
         type=int,
-        default=10,
+        default=40,
         help="Number of local training epochs for the classification model.",
     )
     parser.add_argument(
         "--class-lr",
         type=float,
-        default=0.0001,
+        default=0.01,
         help="Learning rate for the classification model.",
     )
     parser.add_argument("--momentum", type=float, default=0.9, help="momentum for SGD")
@@ -182,7 +233,7 @@ def get_fedavg_argparser():
         help="whether to use generator for classification",
     )
     parser.add_argument(
-        "--class-test-gap", type=int, default=1, help="The gap between two test rounds"
+        "--class-test-gap", type=int, default=40, help="The gap between two test rounds"
     )
     parser.add_argument(
         "--class-valid",
@@ -206,7 +257,13 @@ class FedAvgServer:
         self.algo = algo
         fix_random_seed(self.args.seed_server)
         begin_time = str(local_time())
-        self.out_dir = OUT_DIR / self.algo / self.args.dataset / begin_time
+        self.out_dir = (
+            OUT_DIR
+            / self.algo
+            / self.args.dataset
+            / self.args.out_dir
+            / (self.args.log_name if self.args.log_name else begin_time)
+        )
         if not os.path.exists(self.out_dir):
             os.makedirs(self.out_dir)
 
@@ -252,7 +309,12 @@ class FedAvgServer:
         ]
         self.classification_dataset_test = DATASETS[self.args.dataset](self.args, client_id="test")
         self.classification_dataloader_test = DataLoader(
-            self.classification_dataset_test, batch_size=self.args.class_batch_size, shuffle=False
+            self.classification_dataset_test,
+            batch_size=self.args.class_batch_size,
+            shuffle=False,
+            collate_fn=lambda batch: CALLATE_FNC[self.args.dataset](
+                batch, self.args, "classification"
+            ),
         )
         if self.args.gen_valid:
             self.generation_dataset_valid = DATASETS[self.args.dataset](
@@ -269,6 +331,9 @@ class FedAvgServer:
                 self.classification_dataset_valid,
                 batch_size=self.args.class_batch_size,
                 shuffle=False,
+                collate_fn=lambda batch: CALLATE_FNC[self.args.dataset](
+                    batch, self.args, "classification"
+                ),
             )
         # Client & Model
         self.client_list = [
@@ -284,12 +349,21 @@ class FedAvgServer:
     def generation_workflow(self):
         # train generation model
         self.gen_round_begin = 0
-        if self.args.gen_resume:
-            self.gen_resume()
+
         # calculate weights for each client for model aggregation
-        client_datanum_list = [len(dataset) for dataset in self.generation_dataset_train]
+        client_datanum_list = [
+            dataset.data_amount("generation") for dataset in self.generation_dataset_train
+        ]
         total_datanum = sum(client_datanum_list)
         client_weights_list = [datanum / total_datanum for datanum in client_datanum_list]
+        # unify generation model weights
+        if self.args.gen_resume:
+            self.gen_resume()
+        else:
+            for client_idx in range(self.args.client_num):
+                self.client_list[client_idx].load_generation_model_weights(
+                    self.client_list[0].get_generation_model_weights()
+                )
         for round_idx in range(self.gen_round_begin, self.args.gen_round):
             client_generation_model_weights_list: List[List[OrderedDict]] = []
             self.logger.log("=" * 20, "Round:", round_idx, "Generation Start Training", "=" * 20)
@@ -313,7 +387,8 @@ class FedAvgServer:
             # valid and test generation model
             if (round_idx + 1) % self.args.gen_test_gap == 0:
                 self.gen_valid_test(aggregated_model_weights)
-                self.generate_image()
+                if self.args.dataset != "adni_roi":
+                    self.generate_image()
 
         self.gen_plot_test_result()
 
@@ -361,11 +436,11 @@ class FedAvgServer:
                 for key in model_dict.keys():
                     if client_idx == 0:
                         aggregated_model_dict_list[model_idx][key] = (
-                            model_dict[key] * client_weights_list[client_idx]
+                            client_weights_list[client_idx] * model_dict[key]
                         )
                     else:
                         aggregated_model_dict_list[model_idx][key] += (
-                            model_dict[key] * client_weights_list[client_idx]
+                            client_weights_list[client_idx] * model_dict[key]
                         )
         return aggregated_model_dict_list
 
@@ -386,25 +461,32 @@ class FedAvgServer:
         aggregated_model_dict_list = checkpoint["model_state_dict_list"]
         for client in self.client_list:
             client.load_generation_model_weights(aggregated_model_dict_list, resume=True)
+        self.generation_model.download_weights(aggregated_model_dict_list)
 
     def classification_workflow(self):
-        client_datanum_list = [len(dataset) for dataset in self.classification_dataset_train]
+        client_datanum_list = [
+            dataset.data_amount("classification") for dataset in self.classification_dataset_train
+        ]
         total_datanum = sum(client_datanum_list)
         client_weights_list = [datanum / total_datanum for datanum in client_datanum_list]
+        for client_idx in range(self.args.client_num):
+            self.client_list[client_idx].load_classification_model_weights(
+                [self.classification_model.state_dict()]
+            )
         for round_idx in range(self.args.class_round):
-            client_classification_model_weights_list: List[List[OrderedDict]] = []
             self.logger.log(
                 "=" * 20, "Round:", round_idx, "Classification Start Training", "=" * 20
             )
+            client_classification_model_weights_map = {}
             for client_idx in range(self.args.client_num):
-                self.logger.log("Client", client_idx, "Begin")
+                self.logger.log(local_time(), " Client", client_idx, "Training Start")
                 self.client_list[client_idx].classification_workflow()
-                client_classification_model_weights_list.append(
-                    self.client_list[client_idx].get_classification_model_weights()
-                )
+                client_classification_model_weights_map[client_idx] = self.client_list[
+                    client_idx
+                ].get_classification_model_weights()
 
-            aggregated_model_weights = self.gen_aggreation(
-                client_classification_model_weights_list, client_weights_list
+            aggregated_model_weights = self.classification_aggregation(
+                client_classification_model_weights_map, client_weights_list
             )
 
             for client_idx in range(self.args.client_num):
@@ -413,95 +495,116 @@ class FedAvgServer:
                 )
             if (round_idx + 1) % self.args.class_test_gap == 0:
                 self.classification_model.load_state_dict(aggregated_model_weights[0])
-                self.class_valid_test()
+                self.class_valid_test_workflow()
 
         pass
 
-    def class_valid_test(self):
+    def client_classification_process(self, client_idx, client_classification_model_weights_map):
+        self.client_list[client_idx].classification_workflow()
+        client_classification_model_weights_map[client_idx] = self.client_list[
+            client_idx
+        ].get_classification_model_weights()
+
+    def class_valid_test_workflow(self):
         self.classification_model = move2device(
             self.device, self.args.multi_gpu, self.classification_model
         )
         self.classification_model.eval()
         with torch.no_grad():
-            criterion = nn.CrossEntropyLoss(weight=torch.tensor([1, 3.54]).to(self.device))
             if self.args.class_valid:
-                loss = 0.0
-                accurate_num = 0
-                total_num = 0
-                confusion_matrix = torch.zeros(
-                    self.classification_dataset_valid.num_classes,
-                    self.classification_dataset_valid.num_classes,
-                )
+                self.logger.log(local_time(), " Validation Start")
+                self.classification_test(self.classification_dataloader_valid)
+            self.logger.log(local_time(), " Test Start")
+            self.classification_test(self.classification_dataloader_test)
+        self.classification_model = move2cpu(self.classification_model)
 
-                for batch in self.classification_dataloader_valid:
-                    image, label = self.classification_dataset_valid.class_organize_batch(
-                        batch, self.args, self.device
-                    )
-                    image = image.to(self.device)
-                    label = label.to(self.device)
-                    output = self.classification_model(image)
-                    predictions = torch.argmax(output, dim=1)
-                    accurate_num += (predictions == label).sum().item()
-                    total_num += label.size(0)
-                    loss += criterion(output, label).item()
-                    for i in range(predictions.size(0)):
-                        true_label = label[i].item()
-                        predicted_label = predictions[i].item()
-                        confusion_matrix[true_label][predicted_label] += 1
-                precision = torch.diag(confusion_matrix) / confusion_matrix.sum(dim=0)
-                recall = torch.diag(confusion_matrix) / confusion_matrix.sum(dim=1)
-                f1 = 2 * precision * recall / (precision + recall)
-                accuracy = (torch.diag(confusion_matrix).sum() / confusion_matrix.sum()).item()
-                self.logger.log(f"Confusion matrix:{confusion_matrix.tolist()}")
-                self.logger.log(f"Precision: {precision.tolist()}")
-                self.logger.log(f"Recall: {recall.tolist()}")
-                self.logger.log(f"F1: {f1.tolist()}")
-                self.logger.log("Validation Average Accuracy: {:.4f}%".format(100 * accuracy))
-                self.logger.log(
-                    "Validation Average Loss: {:.4f}".format(
-                        loss / len(self.classification_dataloader_valid)
-                    )
-                )
+    def classification_test(self, dataloader):
+        criterion = nn.CrossEntropyLoss().to(self.device)
+        """
+        real modality0 + real modality1
+        """
+        label_all = []
+        prediction_all = []
+        for batch in dataloader:
+            batch, _, _, _ = batch
+            modality0_volumes = batch["modality0"].to(self.device)
+            modality1_volumes = batch["modality1"].to(self.device)
+            predict_result = self.classification_model(modality0_volumes, modality1_volumes)
+            predict_result = torch.argmax(predict_result, dim=1)
+            label = batch["label"]
+            prediction_all.extend(predict_result.cpu().numpy())
+            label_all.extend(label.cpu().numpy())
+        cm, precision, recall, f1_score, acc = FedAvgClient.classification_metric(
+            label_all, prediction_all
+        )
+        self.logger.log("*****real modality0 + real modality1*****")
+        self.logger.log(f"Confusion matrix:\n{cm}")
+        self.logger.log(f"Precision={precision*100:.2f}%")
+        self.logger.log(f"Recall={recall*100:.2f}%")
+        self.logger.log(f"F1={f1_score*100:.2f}%")
+        self.logger.log(f"Accuracy={acc*100:.2f}%")
+        if self.args.use_generator:
+            self.generation_model.move2device()
+            self.generation_model.gen_021.eval()
+            self.generation_model.gen_120.eval()
+            """
+            real modality0 + generated modality1
+            """
+            label_all = []
+            prediction_all = []
+            for batch in dataloader:
+                batch, _, _, _ = batch
+                modality0_volumes = batch["modality0"].to(self.device)
+                fake_modality1 = self.generation_model.gen_021(modality0_volumes)
+                predict_result = self.classification_model(modality0_volumes, fake_modality1)
+                predict_result = torch.argmax(predict_result, dim=1)
+                label = batch["label"]
+                prediction_all.extend(predict_result.cpu().numpy())
+                label_all.extend(label.cpu().numpy())
+            cm, precision, recall, f1_score, acc = FedAvgClient.classification_metric(
+                label_all, prediction_all
+            )
+            self.logger.log("*****real modality0 + generated modality1*****")
+            self.logger.log(f"Confusion matrix:\n{cm}")
+            self.logger.log(f"Precision={precision*100:.2f}%")
+            self.logger.log(f"Recall={recall*100:.2f}%")
+            self.logger.log(f"F1={f1_score*100:.2f}%")
+            self.logger.log(f"Accuracy={acc*100:.2f}%")
+            """
+            generated modality0 + real modality1
+            """
+            label_all = []
+            prediction_all = []
+            for batch in dataloader:
+                batch, _, _, _ = batch
+                modality1_volumes = batch["modality1"].to(self.device)
+                fake_modality0 = self.generation_model.gen_120(modality1_volumes)
+                predict_result = self.classification_model(fake_modality0, modality1_volumes)
+                predict_result = torch.argmax(predict_result, dim=1)
+                label = batch["label"]
+                prediction_all.extend(predict_result.cpu().numpy())
+                label_all.extend(label.cpu().numpy())
+            cm, precision, recall, f1_score, acc = FedAvgClient.classification_metric(
+                label_all, prediction_all
+            )
+            self.logger.log("*****generated modality0 + real modality1*****")
+            self.logger.log(f"Confusion matrix:\n{cm}")
+            self.logger.log(f"Precision={precision*100:.2f}%")
+            self.logger.log(f"Recall={recall*100:.2f}%")
+            self.logger.log(f"F1={f1_score*100:.2f}%")
+            self.logger.log(f"Accuracy={acc*100:.2f}%")
+            self.generation_model.move2cpu()
 
-            loss = 0.0
-            accurate_num = 0
-            total_num = 0
-            confusion_matrix = torch.zeros(
-                self.classification_dataset_valid.num_classes,
-                self.classification_dataset_valid.num_classes,
-            )
-            for batch in self.classification_dataloader_test:
-
-                image, label = self.classification_dataset_test.class_organize_batch(
-                    batch, self.args, self.device
+    def classification_aggregation(self, state_dict_map, weights_list: List) -> List:
+        weighted_average_dict = {}
+        for key in state_dict_map[0][0]:
+            weighted_average_dict[key] = torch.zeros_like(state_dict_map[0][0][key])
+        for client_idx in state_dict_map.keys():
+            for key in state_dict_map[0][0]:
+                weighted_average_dict[key] += (
+                    state_dict_map[client_idx][0][key] * weights_list[client_idx]
                 )
-                image = image.to(self.device)
-                label = label.to(self.device)
-                output = self.classification_model(image)
-                predictions = torch.argmax(output, dim=1)
-                accurate_num += (predictions == label).sum().item()
-                total_num += label.size(0)
-                loss += criterion(output, label).item()
-                for i in range(predictions.size(0)):
-                    true_label = label[i].item()
-                    predicted_label = predictions[i].item()
-                    confusion_matrix[true_label][predicted_label] += 1
-            precision = torch.diag(confusion_matrix) / confusion_matrix.sum(dim=0)
-            recall = torch.diag(confusion_matrix) / confusion_matrix.sum(dim=1)
-            f1 = 2 * precision * recall / (precision + recall)
-            accuracy = (torch.diag(confusion_matrix).sum() / confusion_matrix.sum()).item()
-            self.logger.log(
-                "Validation Average Accuracy: {:.4f}%".format(100 * accurate_num / total_num)
-            )
-            self.logger.log(f"Confusion matrix:{confusion_matrix.tolist()}")
-            self.logger.log(f"Precision: {precision.tolist()}")
-            self.logger.log(f"Recall: {recall.tolist()}")
-            self.logger.log(f"F1: {f1.tolist()}")
-            self.logger.log("Test Average Accuracy: {:.4f}%".format(100 * accuracy))
-            self.logger.log(
-                "Test Average Loss: {:.4f}".format(loss / len(self.classification_dataloader_test))
-            )
-            self.classification_model = move2cpu(self.classification_model)
+        return [weighted_average_dict]
 
     def run(self):
         pass

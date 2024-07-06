@@ -147,10 +147,11 @@ class Logger:
 
 def update_args_from_dict(args, config_dict):
     for key, value in config_dict.items():
-        if hasattr(args, key):
-            raise Warning(f"args and config_dict have the same key: {key}")
-        else:
+        try:
             setattr(args, key, value)
+        except:
+            raise ValueError(f"Error when updata args from dict")
+
     return args
 
 

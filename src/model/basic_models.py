@@ -5,6 +5,10 @@ import functools
 
 
 # __all__ = ["CycleGen", "CycleDis", "UNetDown", "UNetUp"]
+OPTIMIZER = {
+    "adam": torch.optim.Adam,
+    "sgd": torch.optim.SGD,
+}
 
 
 def get_norm_layer(norm_type="instance"):
@@ -525,19 +529,239 @@ class UnetGenerator(nn.Module):
         return self.model(input)
 
 
+class linear_mlp(nn.Module):
+    def __init__(self, indim, out_dim):
+        super(linear_mlp, self).__init__()
+        self.linear = nn.Linear(indim, out_dim)
+        self.norm = nn.InstanceNorm1d(out_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.norm(x)
+        x = self.relu(x)
+        return x
+
+
+class mlp_res_block(nn.Module):
+    def __init__(self, indim, out_dim):
+        super(mlp_res_block, self).__init__()
+        self.linear1 = linear_mlp(indim, out_dim)
+        self.linear2 = linear_mlp(out_dim, out_dim)
+
+    def forward(self, x):
+        y = self.linear1(x)
+        y = self.linear2(y)
+        x = y + x
+        return x
+
+
+class downsample(nn.Module):
+    def __init__(self, indim, out_dim):
+        super(downsample, self).__init__()
+        self.linear = linear_mlp(indim, out_dim)
+        self.resblock = mlp_res_block(out_dim, out_dim)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.resblock(x)
+        return x
+
+
+class upsample(nn.Module):
+    def __init__(self, indim, out_dim):
+        super(upsample, self).__init__()
+        self.resblock = mlp_res_block(indim, out_dim)
+
+        self.linear = linear_mlp(out_dim, out_dim)
+
+    def forward(self, x):
+        x = self.resblock(x)
+        x = self.linear(x)
+        return x
+
+
+class MLPGenerator(nn.Module):
+    def __init__(self, input_dim=90, output_dim=90):
+        super(MLPGenerator, self).__init__()
+        res_dim = 8
+        self.network = nn.Sequential(
+            linear_mlp(input_dim, 64),
+            linear_mlp(64, 32),
+            linear_mlp(32, 16),
+            linear_mlp(16, 8),
+            mlp_res_block(res_dim, res_dim),
+            mlp_res_block(res_dim, res_dim),
+            mlp_res_block(res_dim, res_dim),
+            mlp_res_block(res_dim, res_dim),
+            # mlp_res_block(res_dim, res_dim),
+            # mlp_res_block(res_dim, res_dim),
+            linear_mlp(8, 16),
+            linear_mlp(16, 32),
+            linear_mlp(32, 64),
+            nn.Linear(64, output_dim),
+            # nn.Sigmoid(),
+            nn.Tanh(),
+        )
+        # res_dim = 1024
+        # self.network = nn.Sequential(
+        #     linear_mlp(input_dim, 128),
+        #     linear_mlp(128, 256),
+        #     linear_mlp(256, 512),
+        #     linear_mlp(512, 1024),
+        #     mlp_res_block(res_dim, res_dim),
+        #     mlp_res_block(res_dim, res_dim),
+        #     mlp_res_block(res_dim, res_dim),
+        #     mlp_res_block(res_dim, res_dim),
+        #     # mlp_res_block(res_dim, res_dim),
+        #     # mlp_res_block(res_dim, res_dim),
+        #     linear_mlp(1024, 512),
+        #     linear_mlp(512, 256),
+        #     linear_mlp(256, 128),
+        #     nn.Linear(128, output_dim),
+        #     # nn.Sigmoid(),
+        #     nn.Tanh(),
+        # )
+
+    def forward(self, x, label=None):
+        return self.network(x)
+
+
+class MLPDiscriminator(nn.Module):
+    def __init__(self, input_dim=90):
+        super(MLPDiscriminator, self).__init__()
+        # self.network = nn.Sequential(
+        #     # First hidden layer
+        #     nn.Linear(input_dim, 128),
+        #     nn.Tanh(),
+        #     # Second hidden layer
+        #     nn.Linear(128, 256),
+        #     nn.Tanh(),
+        #     nn.Linear(256, 512),
+        #     nn.Tanh(),
+        #     nn.Linear(512, 256),
+        #     nn.Tanh(),
+        #     nn.Linear(256, 128),
+        #     nn.Tanh(),
+        #     nn.Linear(128, 64),
+        #     nn.Tanh(),
+        #     nn.Linear(64, 32),
+        #     nn.Tanh(),
+        #     # # Output layer
+        #     nn.Linear(32, 16),
+        #     nn.Tanh(),
+        #     nn.Linear(16, 4),
+        #     nn.Sigmoid(),  # Sigmoid to output a probability
+        # )
+        # self.network = nn.Sequential(
+        #     # First hidden layer
+        #     linear_mlp(input_dim, 64),
+        #     linear_mlp(64, 32),
+        #     linear_mlp(32, 16),
+        #     mlp_res_block(16, 16),
+        #     mlp_res_block(16, 16),
+        #     mlp_res_block(16, 16),
+        #     nn.Linear(16, 4),
+        #     # nn.Tanh(),
+        #     nn.Sigmoid(),
+        # )
+        self.network = nn.Sequential(
+            # First hidden layer
+            linear_mlp(input_dim, 128),
+            linear_mlp(128, 256),
+            mlp_res_block(256, 256),
+            mlp_res_block(256, 256),
+            mlp_res_block(256, 256),
+            linear_mlp(256, 128),
+            linear_mlp(128, 64),
+            linear_mlp(64, 32),
+            linear_mlp(32, 16),
+            nn.Linear(16, 4),
+            # nn.Tanh(),
+            nn.Sigmoid(),
+        )
+        # self.network = nn.Sequential(
+        #     # First hidden layer
+        #     nn.Linear(input_dim, 128),
+        #     nn.Tanh(),
+        #     nn.Linear(128, 256),
+        #     nn.Tanh(),
+        #     linear_mlp(256, 512),
+        #     linear_mlp(512, 1024),
+        #     linear_mlp(1024, 512),
+        #     linear_mlp(512, 256),
+        #     # Second hidden layer
+        #     nn.Linear(256, 128),
+        #     nn.Tanh(),
+        #     nn.Linear(128, 64),
+        #     nn.Tanh(),
+        #     nn.Linear(64, 32),
+        #     nn.Tanh(),
+        #     # nn.Linear(128, 64),
+        #     # nn.Tanh(),
+        #     # nn.Linear(64, 32),
+        #     # nn.Tanh(),
+        #     # # Output layer
+        #     nn.Linear(32, 16),
+        #     nn.Tanh(),
+        #     nn.Linear(16, 4),
+        #     # nn.Linear(16, 1),
+        #     # nn.Sigmoid(),  # Sigmoid to output a probability
+        # )
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class Pixel2PixelDiscriminator(nn.Module):
+    def __init__(self, input_dim=90 * 2):
+        super(Pixel2PixelDiscriminator, self).__init__()
+        # self.network = nn.Sequential(
+        #     # First hidden layer
+        #     linear_mlp(input_dim, 124),
+        #     linear_mlp(124, 256),
+        #     linear_mlp(256, 124),
+        #     linear_mlp(124, 64),
+        #     linear_mlp(64, 32),
+        #     linear_mlp(32, 16),
+        #     mlp_res_block(16, 16),
+        #     mlp_res_block(16, 16),
+        #     mlp_res_block(16, 16),
+        #     nn.Linear(16, 4),
+        #     # nn.Tanh(),
+        #     nn.Sigmoid(),
+        # )
+        self.network = nn.Sequential(
+            # First hidden layer
+            linear_mlp(input_dim, 256),
+            linear_mlp(256, 512),
+            mlp_res_block(512, 512),
+            mlp_res_block(512, 512),
+            mlp_res_block(512, 512),
+            linear_mlp(512, 256),
+            linear_mlp(256, 124),
+            linear_mlp(124, 64),
+            linear_mlp(64, 32),
+            linear_mlp(32, 16),
+            nn.Linear(16, 4),
+            # nn.Tanh(),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, source_sample, target_sample):
+        return self.network(torch.cat((source_sample, target_sample), 1))
+
+
 if __name__ == "__main__":
 
     # gen_model = UnetGenerator(num_downs=8)
-    gen_model = ResnetGenerator(n_blocks=9)
+    # Create an instance of the generator
+    generator = MLPGenerator()
 
-    batch_size = 4
-    channels = 1
-    height = 256
-    width = 256
-    random_tensors = torch.randn(batch_size, channels, height, width)
-    geneerate_image = gen_model(random_tensors)
-    print(geneerate_image.shape)
-    discriminator = NLayerDiscriminator(n_layers=6)
-    discriminator = CycleDis(random_tensors.shape[1:])
-    output = discriminator(random_tensors)
-    print(output.shape)
+    # Generate a random input vector of size 90
+    input_vector = torch.randn(1, 90)  # Batch size of 1, dimension of 90
+
+    # Generate a sample using the MLP generator
+    generated_sample = generator(input_vector)
+    print(generated_sample)
+    print(generated_sample.shape)
